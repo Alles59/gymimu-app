@@ -1,0 +1,352 @@
+<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#08111f">
+    <title>GymIMU Training</title>
+    <link rel="stylesheet" href="style.css">
+    <script src="app.js" defer></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="app-header">
+        <div>
+          <p class="eyebrow">Fitness IMU Gadget</p>
+          <h1>GymIMU Training</h1>
+        </div>
+        <div class="header-status">
+          <span id="connectionStatus" class="status status-offline" role="status">Nicht verbunden</span>
+          <span id="demoStatus" class="status status-offline">Demo aus</span>
+        </div>
+      </header>
+
+      <div id="message" class="message" role="alert" aria-live="polite" hidden></div>
+
+      <nav class="tabs" aria-label="App-Bereiche">
+        <button class="tab-button active" type="button" data-tab="dashboard">Dashboard</button>
+        <button class="tab-button" type="button" data-tab="exercises">Übungen</button>
+        <button class="tab-button" type="button" data-tab="recording">Aufnahme</button>
+        <button class="tab-button" type="button" data-tab="analysis">Analyse</button>
+        <button class="tab-button" type="button" data-tab="data">Daten</button>
+      </nav>
+
+      <main>
+        <section id="tab-dashboard" class="tab-panel active" data-panel="dashboard">
+          <div class="page-heading">
+            <div>
+              <p class="eyebrow">Überblick</p>
+              <h2>Trainings-Dashboard</h2>
+            </div>
+            <button type="button" class="primary compact" data-go-tab="recording">Neue Aufnahme</button>
+          </div>
+
+          <div id="dashboardCards" class="dashboard-grid"></div>
+
+          <article class="panel">
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">Letzter Satz</p>
+                <h2 id="lastSetTitle">Noch kein Satz gespeichert</h2>
+              </div>
+              <span id="lastSetScore" class="score score-neutral">—</span>
+            </div>
+            <div id="lastSetContent" class="empty-state">
+              Wähle eine Übung und speichere einen Trainingssatz.
+            </div>
+          </article>
+        </section>
+
+        <section id="tab-exercises" class="tab-panel" data-panel="exercises">
+          <div class="page-heading">
+            <div>
+              <p class="eyebrow">Bibliothek</p>
+              <h2>Übungen verwalten</h2>
+            </div>
+            <button id="newExerciseButton" type="button" class="primary">Übung anlegen</button>
+          </div>
+
+          <form id="exerciseForm" class="panel form-panel" hidden>
+            <div class="section-heading">
+              <h2 id="exerciseFormTitle">Neue Übung</h2>
+              <button id="cancelExerciseButton" type="button" class="button-quiet">Abbrechen</button>
+            </div>
+            <input id="exerciseId" type="hidden">
+            <div class="form-grid">
+              <label>
+                Name *
+                <input id="exerciseName" name="name" required placeholder="z. B. Brustpresse">
+              </label>
+              <label>
+                Gerätetyp
+                <select id="equipmentType" name="equipmentType">
+                  <option>Geführte Maschine</option>
+                  <option>Kabelzug</option>
+                  <option>Freie Bewegung</option>
+                  <option>Sonstiges</option>
+                </select>
+              </label>
+              <label>
+                Muskelgruppe
+                <input id="muscleGroup" name="muscleGroup" placeholder="z. B. Brust">
+              </label>
+              <label>
+                Gewicht
+                <input id="exerciseWeight" name="weight" placeholder="z. B. 50 kg">
+              </label>
+              <label>
+                Sensorposition
+                <input id="sensorPosition" name="sensorPosition" placeholder="z. B. Gewichtsblock">
+              </label>
+              <label class="form-wide">
+                Notizen
+                <textarea id="exerciseNotes" name="notes" rows="3" placeholder="Setup, Sitzposition, Hinweise …"></textarea>
+              </label>
+            </div>
+            <button type="submit" class="primary">Übung speichern</button>
+          </form>
+
+          <div id="exerciseList" class="card-list"></div>
+        </section>
+
+        <section id="tab-recording" class="tab-panel" data-panel="recording">
+          <div class="page-heading">
+            <div>
+              <p class="eyebrow">Live</p>
+              <h2>Aufnahme</h2>
+            </div>
+            <span id="recordingBadge" class="status status-offline">Bereit</span>
+          </div>
+
+          <article class="panel setup-panel">
+            <div class="form-grid recording-setup">
+              <label>
+                Übung
+                <select id="recordingExerciseSelect"></select>
+              </label>
+              <label>
+                Demo-Szenario
+                <select id="demoProfile">
+                  <option value="clean">Saubere Referenz</option>
+                  <option value="fast">Zu schnell</option>
+                  <option value="short">Verkürzte Amplitude</option>
+                  <option value="jerky">Ruckartige Bewegung</option>
+                  <option value="fatigue">Ermüdung gegen Satzende</option>
+                </select>
+              </label>
+            </div>
+            <div class="button-row">
+              <button id="connectButton" type="button" class="primary">Connect BLE</button>
+              <button id="demoButton" type="button">Demo-Modus starten</button>
+            </div>
+          </article>
+
+          <div class="recording-actions">
+            <button id="startReferenceButton" type="button" class="action-card reference-action">
+              <span class="action-icon">R</span>
+              <span><strong>Referenz aufnehmen</strong><small>Saubere Ausführung als Vorlage</small></span>
+            </button>
+            <button id="startSetButton" type="button" class="action-card set-action">
+              <span class="action-icon">S</span>
+              <span><strong>Trainingssatz starten</strong><small>Mit der Referenz vergleichen</small></span>
+            </button>
+          </div>
+
+          <section class="live-stats">
+            <article class="metric-card">
+              <span>Modus</span>
+              <strong id="recordingModeValue">—</strong>
+            </article>
+            <article class="metric-card">
+              <span>Zeit</span>
+              <strong id="recordingTime">00:00.0</strong>
+            </article>
+            <article class="metric-card">
+              <span>Samples</span>
+              <strong id="sampleCount">0</strong>
+            </article>
+            <article class="metric-card highlight">
+              <span>Reps erkannt</span>
+              <strong id="liveRepCount">0</strong>
+            </article>
+            <article class="metric-card">
+              <span>accMagnitude</span>
+              <strong id="accMagnitudeValue">—</strong>
+            </article>
+            <article class="metric-card">
+              <span>gyroMagnitude</span>
+              <strong id="gyroMagnitudeValue">—</strong>
+            </article>
+          </section>
+
+          <article class="panel live-values">
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">Sensor</p>
+                <h2 id="liveExerciseName">Keine Übung ausgewählt</h2>
+              </div>
+              <span id="sampleTimestamp" class="muted">t = — ms</span>
+            </div>
+            <div class="sensor-values">
+              <span>ax <strong id="axValue">—</strong></span>
+              <span>ay <strong id="ayValue">—</strong></span>
+              <span>az <strong id="azValue">—</strong></span>
+              <span>gx <strong id="gxValue">—</strong></span>
+              <span>gy <strong id="gyValue">—</strong></span>
+              <span>gz <strong id="gzValue">—</strong></span>
+            </div>
+          </article>
+
+          <div class="chart-grid">
+            <article class="panel chart-card">
+              <div class="chart-title">
+                <h2>accMagnitude</h2>
+                <span>Rep-Marker inklusive</span>
+              </div>
+              <canvas id="accChart" aria-label="Live-Beschleunigungsdiagramm"></canvas>
+            </article>
+            <article class="panel chart-card">
+              <div class="chart-title">
+                <h2>gyroMagnitude</h2>
+                <span>Live-Verlauf</span>
+              </div>
+              <canvas id="gyroChart" aria-label="Live-Gyroskopdiagramm"></canvas>
+            </article>
+          </div>
+
+          <div class="button-row recording-controls">
+            <button id="stopButton" type="button" class="danger" disabled>Stop</button>
+            <button id="discardButton" type="button" disabled>Aufnahme verwerfen</button>
+            <button id="saveRecordingButton" type="button" class="primary" disabled>Aufnahme speichern</button>
+          </div>
+
+          <article id="recordingPreview" class="panel result-panel" hidden></article>
+        </section>
+
+        <section id="tab-analysis" class="tab-panel" data-panel="analysis">
+          <div class="page-heading">
+            <div>
+              <p class="eyebrow">Historie</p>
+              <h2>Analyse & Vergleich</h2>
+            </div>
+            <select id="analysisExerciseSelect" aria-label="Übung für Analyse auswählen"></select>
+          </div>
+
+          <article id="analysisEmpty" class="panel empty-state">
+            Lege eine Übung an und speichere Aufnahmen, um sie hier zu vergleichen.
+          </article>
+
+          <div id="analysisContent" hidden>
+            <article class="panel">
+              <div class="section-heading">
+                <div>
+                  <p class="eyebrow">Kurvenauswahl</p>
+                  <h2>Aufnahmen überlagern</h2>
+                </div>
+                <label class="toggle-label">
+                  <input id="showRepMarkers" type="checkbox" checked>
+                  Rep-Marker
+                </label>
+              </div>
+              <div id="recordingCheckboxes" class="checkbox-list"></div>
+              <div id="overlayLegend" class="legend"></div>
+            </article>
+
+            <div class="chart-grid">
+              <article class="panel chart-card">
+                <div class="chart-title">
+                  <h2>accMagnitude Overlay</h2>
+                  <span>Zeitlich normalisiert</span>
+                </div>
+                <canvas id="accOverlayChart" aria-label="Beschleunigungs-Overlay"></canvas>
+              </article>
+              <article class="panel chart-card">
+                <div class="chart-title">
+                  <h2>gyroMagnitude Overlay</h2>
+                  <span>Zeitlich normalisiert</span>
+                </div>
+                <canvas id="gyroOverlayChart" aria-label="Gyroskop-Overlay"></canvas>
+              </article>
+            </div>
+
+            <article class="panel table-panel">
+              <div class="section-heading">
+                <div>
+                  <p class="eyebrow">Metriken</p>
+                  <h2>Vergleichstabelle</h2>
+                </div>
+              </div>
+              <div class="table-scroll">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Aufnahme</th>
+                      <th>Score</th>
+                      <th>Reps</th>
+                      <th>Dauer</th>
+                      <th>Ø Rep</th>
+                      <th>Amplitude</th>
+                      <th>Smoothness</th>
+                      <th>Tempo</th>
+                    </tr>
+                  </thead>
+                  <tbody id="metricsTableBody"></tbody>
+                </table>
+              </div>
+            </article>
+
+            <div id="feedbackList" class="feedback-list"></div>
+          </div>
+        </section>
+
+        <section id="tab-data" class="tab-panel" data-panel="data">
+          <div class="page-heading">
+            <div>
+              <p class="eyebrow">Backup & Export</p>
+              <h2>Daten verwalten</h2>
+            </div>
+          </div>
+
+          <article class="panel">
+            <h2>Gesamtdaten</h2>
+            <p class="muted">Sichere oder übertrage alle Übungen, Referenzen und Sätze.</p>
+            <div class="button-row">
+              <button id="exportAllButton" type="button" class="primary">Alle Daten als JSON</button>
+              <button id="importButton" type="button">JSON importieren</button>
+              <input id="importFileInput" type="file" accept="application/json,.json" hidden>
+            </div>
+          </article>
+
+          <article class="panel">
+            <h2>Übung und Aufnahme</h2>
+            <div class="form-grid">
+              <label>
+                Übung
+                <select id="exportExerciseSelect"></select>
+              </label>
+              <label>
+                Gespeicherte Aufnahme
+                <select id="exportRecordingSelect"></select>
+              </label>
+            </div>
+            <div class="button-row">
+              <button id="downloadCurrentCsvButton" type="button">Aktuelle Aufnahme als CSV</button>
+              <button id="downloadSavedCsvButton" type="button">Ausgewählte Aufnahme als CSV</button>
+              <button id="exportExerciseButton" type="button">Alle Sätze der Übung als JSON</button>
+            </div>
+          </article>
+
+          <article class="panel danger-zone">
+            <h2>Lokale Daten löschen</h2>
+            <p>Entfernt alle Übungen, Referenzen und Trainingssätze aus diesem Browser.</p>
+            <button id="deleteAllButton" type="button" class="danger">Alle lokalen Daten löschen</button>
+          </article>
+        </section>
+      </main>
+
+      <footer>
+        Lokale Fitnessanalyse – kein medizinisches Messgerät. Web Bluetooth benötigt localhost oder HTTPS.
+      </footer>
+    </div>
+  </body>
+</html>
