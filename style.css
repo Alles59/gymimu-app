@@ -584,6 +584,15 @@ canvas {
   gap: 0.45rem;
 }
 
+.future-toggle {
+  min-height: 46px;
+  border: 1px dashed var(--border);
+  border-radius: 10px;
+  padding: 0.62rem 0.75rem;
+  background: rgba(21, 34, 56, 0.62);
+  color: var(--muted);
+}
+
 .toggle-label input,
 .checkbox-item input {
   width: auto;

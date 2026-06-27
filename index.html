@@ -98,6 +98,16 @@
                 Sensorposition
                 <input id="sensorPosition" name="sensorPosition" placeholder="z. B. Gewichtsblock">
               </label>
+              <label>
+                Analysemodus
+                <select id="analysisMode" name="analysisMode">
+                  <option value="weight_stack">Gewichtsblock / geführte Maschine</option>
+                  <option value="barbell">Langhantel / Stangenachse</option>
+                  <option value="cable_handle">Griff / Kabelzug</option>
+                  <option value="free_movement">Freie Bewegung</option>
+                  <option value="body_segment">Körpersegment (Future Mode)</option>
+                </select>
+              </label>
               <label class="form-wide">
                 Notizen
                 <textarea id="exerciseNotes" name="notes" rows="3" placeholder="Setup, Sitzposition, Hinweise …"></textarea>
@@ -138,6 +148,11 @@
             <div class="button-row">
               <button id="connectButton" type="button" class="primary">Connect BLE</button>
               <button id="demoButton" type="button">Demo-Modus starten</button>
+              <button id="calibrateButton" type="button">Sensor kalibrieren</button>
+              <label class="toggle-label future-toggle">
+                <input id="audioFeedbackToggle" type="checkbox" disabled>
+                Audiofeedback später aktivieren
+              </label>
             </div>
           </article>
 
@@ -156,6 +171,10 @@
             <article class="metric-card">
               <span>Modus</span>
               <strong id="recordingModeValue">—</strong>
+            </article>
+            <article class="metric-card">
+              <span>Analyse</span>
+              <strong id="analysisModeValue">—</strong>
             </article>
             <article class="metric-card">
               <span>Zeit</span>
@@ -200,15 +219,15 @@
           <div class="chart-grid">
             <article class="panel chart-card">
               <div class="chart-title">
-                <h2>accMagnitude</h2>
+                <h2 id="livePrimaryChartTitle">Bewegungssignal</h2>
                 <span>Rep-Marker inklusive</span>
               </div>
               <canvas id="accChart" aria-label="Live-Beschleunigungsdiagramm"></canvas>
             </article>
             <article class="panel chart-card">
               <div class="chart-title">
-                <h2>gyroMagnitude</h2>
-                <span>Live-Verlauf</span>
+                <h2 id="liveSecondaryChartTitle">Gyro / Stabilität</h2>
+                <span>Live-Verlauf je nach Analysemodus</span>
               </div>
               <canvas id="gyroChart" aria-label="Live-Gyroskopdiagramm"></canvas>
             </article>
@@ -255,17 +274,45 @@
             <div class="chart-grid">
               <article class="panel chart-card">
                 <div class="chart-title">
-                  <h2>accMagnitude Overlay</h2>
+                  <h2 id="overlayPrimaryTitle">Referenz vs Satz</h2>
                   <span>Zeitlich normalisiert</span>
                 </div>
                 <canvas id="accOverlayChart" aria-label="Beschleunigungs-Overlay"></canvas>
               </article>
               <article class="panel chart-card">
                 <div class="chart-title">
-                  <h2>gyroMagnitude Overlay</h2>
+                  <h2 id="overlaySecondaryTitle">Stabilität / Rotation</h2>
                   <span>Zeitlich normalisiert</span>
                 </div>
                 <canvas id="gyroOverlayChart" aria-label="Gyroskop-Overlay"></canvas>
+              </article>
+              <article class="panel chart-card">
+                <div class="chart-title">
+                  <h2 id="metricChartOneTitle">Amplitude / ROM</h2>
+                  <span>Pro Wiederholung</span>
+                </div>
+                <canvas id="metricChartOne" aria-label="Amplitude pro Wiederholung"></canvas>
+              </article>
+              <article class="panel chart-card">
+                <div class="chart-title">
+                  <h2 id="metricChartTwoTitle">Rep-Dauer</h2>
+                  <span>Pro Wiederholung</span>
+                </div>
+                <canvas id="metricChartTwo" aria-label="Dauer pro Wiederholung"></canvas>
+              </article>
+              <article class="panel chart-card">
+                <div class="chart-title">
+                  <h2 id="metricChartThreeTitle">Tremor / Jerk</h2>
+                  <span>Ruckelbewertung</span>
+                </div>
+                <canvas id="metricChartThree" aria-label="Tremor pro Wiederholung"></canvas>
+              </article>
+              <article class="panel chart-card">
+                <div class="chart-title">
+                  <h2 id="metricChartFourTitle">Stabilität</h2>
+                  <span>Gyro- oder Tilt-Proxy</span>
+                </div>
+                <canvas id="metricChartFour" aria-label="Stabilität pro Wiederholung"></canvas>
               </article>
             </div>
 
@@ -286,8 +333,11 @@
                       <th>Dauer</th>
                       <th>Ø Rep</th>
                       <th>Amplitude</th>
+                      <th>ROM</th>
                       <th>Smoothness</th>
-                      <th>Tempo</th>
+                      <th>Tremor</th>
+                      <th>Stabilität</th>
+                      <th>Fatigue</th>
                     </tr>
                   </thead>
                   <tbody id="metricsTableBody"></tbody>
