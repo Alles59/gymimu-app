@@ -560,6 +560,44 @@ canvas {
   margin-top: 1rem;
 }
 
+.athlete-summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.6rem;
+  margin-top: 1rem;
+}
+
+.athlete-summary div,
+.recommendation-card {
+  border-radius: 10px;
+  padding: 0.75rem;
+  background: var(--panel-2);
+}
+
+.athlete-summary span,
+.recommendation-card span {
+  display: block;
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+
+.athlete-summary strong,
+.recommendation-card strong {
+  display: block;
+  margin-top: 0.2rem;
+  font-size: 1.05rem;
+}
+
+.recommendation-card {
+  margin-top: 0.65rem;
+  border: 1px solid rgba(82, 224, 160, 0.32);
+}
+
+.recommendation-card p {
+  margin: 0.45rem 0 0;
+  color: var(--muted);
+}
+
 .result-grid div {
   border-radius: 10px;
   padding: 0.75rem;
@@ -582,6 +620,28 @@ canvas {
   display: inline-flex;
   align-items: center;
   gap: 0.45rem;
+}
+
+.details-panel summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-weight: 800;
+}
+
+.metric-details {
+  margin-bottom: 1rem;
+}
+
+.metric-details > summary {
+  min-height: 44px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0.75rem 1rem;
+  background: rgba(21, 34, 56, 0.62);
+}
+
+.detail-chart-grid {
+  margin-top: 1rem;
 }
 
 .future-toggle {
@@ -745,6 +805,10 @@ footer {
 
   .result-grid {
     grid-template-columns: repeat(2, 1fr);
+  }
+
+  .athlete-summary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .button-row > button {

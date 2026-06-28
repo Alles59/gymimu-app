@@ -30,6 +30,8 @@ const elements = {
   equipmentType: document.querySelector("#equipmentType"),
   muscleGroup: document.querySelector("#muscleGroup"),
   exerciseWeight: document.querySelector("#exerciseWeight"),
+  targetReps: document.querySelector("#targetReps"),
+  setType: document.querySelector("#setType"),
   sensorPosition: document.querySelector("#sensorPosition"),
   analysisMode: document.querySelector("#analysisMode"),
   exerciseNotes: document.querySelector("#exerciseNotes"),
@@ -57,6 +59,10 @@ const elements = {
   liveExerciseName: document.querySelector("#liveExerciseName"),
   sampleTimestamp: document.querySelector("#sampleTimestamp"),
   recordingPreview: document.querySelector("#recordingPreview"),
+  subjectiveSetPanel: document.querySelector("#subjectiveSetPanel"),
+  setRpe: document.querySelector("#setRpe"),
+  setRir: document.querySelector("#setRir"),
+  setNote: document.querySelector("#setNote"),
   analysisEmpty: document.querySelector("#analysisEmpty"),
   analysisContent: document.querySelector("#analysisContent"),
   recordingCheckboxes: document.querySelector("#recordingCheckboxes"),
@@ -144,6 +150,7 @@ function createInitialState() {
   return {
     version: 1,
     selectedExerciseId: starterId,
+    sessions: [],
     exercises: [
       {
         id: starterId,
@@ -151,6 +158,8 @@ function createInitialState() {
         equipmentType: "Geführte Maschine",
         muscleGroup: "Brust",
         weight: "",
+        targetReps: 10,
+        setType: "hypertrophy",
         sensorPosition: "Gewichtsblock",
         analysisMode: "weight_stack",
         calibrationProfile: null,
@@ -199,9 +208,11 @@ function normalizeImportedState(input) {
     id: String(exercise.id || createId()),
     name: String(exercise.name || "Unbenannte Übung"),
     equipmentType: String(exercise.equipmentType || ""),
-    muscleGroup: String(exercise.muscleGroup || ""),
-    weight: String(exercise.weight || ""),
-    sensorPosition: String(exercise.sensorPosition || ""),
+      muscleGroup: String(exercise.muscleGroup || ""),
+      weight: String(exercise.weight || ""),
+      targetReps: Number(exercise.targetReps) || "",
+      setType: normalizeSetType(exercise.setType),
+      sensorPosition: String(exercise.sensorPosition || ""),
     analysisMode: normalizeAnalysisMode(exercise.analysisMode, exercise.equipmentType),
     notes: String(exercise.notes || ""),
     calibrationProfile: normalizeCalibrationProfile(exercise.calibrationProfile),
@@ -219,8 +230,19 @@ function normalizeImportedState(input) {
   return {
     version: 1,
     selectedExerciseId: selectedExists ? input.selectedExerciseId : exercises[0]?.id || null,
+    sessions: normalizeSessions(input.sessions),
     exercises,
   };
+}
+
+function normalizeSessions(sessions) {
+  return Array.isArray(sessions)
+    ? sessions.map((session) => ({
+        id: String(session.id || createId()),
+        date: isValidDate(session.date) ? session.date : new Date().toISOString(),
+        sets: Array.isArray(session.sets) ? session.sets : [],
+      }))
+    : [];
 }
 
 function normalizeAnalysisMode(value, equipmentType = "") {
@@ -231,6 +253,11 @@ function normalizeAnalysisMode(value, equipmentType = "") {
   if (text.includes("hantel") || text.includes("stange")) return "barbell";
   if (text.includes("frei")) return "free_movement";
   return "weight_stack";
+}
+
+function normalizeSetType(value) {
+  const validTypes = new Set(["technique", "hypertrophy", "strength", "explosive", "warmup"]);
+  return validTypes.has(value) ? value : "hypertrophy";
 }
 
 function normalizeCalibrationProfile(profile) {
@@ -264,7 +291,36 @@ function normalizeRecording(recordingData, exercise = null) {
     rawSamples,
     metrics: { ...(recordingData.metrics || {}), ...metrics },
     comparison: recordingData.comparison || null,
+    subjective: normalizeSubjectiveSet(recordingData.subjective),
+    session: normalizeSessionMeta(recordingData.session),
   };
+}
+
+function normalizeSubjectiveSet(subjective) {
+  return {
+    rpe: Number.isFinite(Number(subjective?.rpe)) ? Number(subjective.rpe) : null,
+    rir: Number.isFinite(Number(subjective?.rir)) ? Number(subjective.rir) : null,
+    note: String(subjective?.note || ""),
+  };
+}
+
+function normalizeSessionMeta(session) {
+  return {
+    date: isValidDate(session?.date) ? session.date : new Date().toISOString(),
+    exerciseId: String(session?.exerciseId || ""),
+    exerciseName: String(session?.exerciseName || ""),
+    weight: String(session?.weight || ""),
+    targetReps: Number(session?.targetReps) || "",
+    setType: normalizeSetType(session?.setType),
+  };
+}
+
+function readSubjectiveSetInputs() {
+  return normalizeSubjectiveSet({
+    rpe: elements.setRpe.value,
+    rir: elements.setRir.value,
+    note: elements.setNote.value.trim(),
+  });
 }
 
 function normalizeSample(sample) {
@@ -455,6 +511,8 @@ function generateDemoSample() {
   const deltaSeconds = Math.max(0.001, (now - demoLastTickAt) / 1000);
   demoLastTickAt = now;
   const profile = elements.demoProfile.value;
+  const exercise = getSelectedExercise();
+  const mode = normalizeAnalysisMode(exercise?.analysisMode, exercise?.equipmentType);
 
   let period = 1.8;
   let amplitude = 0.68;
@@ -480,13 +538,19 @@ function generateDemoSample() {
     : 0;
   const randomNoise = () => (Math.random() - 0.5) * 2 * noiseLevel;
 
-  const ax = 0.08 * direction + jerk * 0.32 + randomNoise();
-  const ay = 0.05 * velocity + jerk * 0.18 + randomNoise();
-  const az = 1 + amplitude * smoothPulse + jerk + randomNoise();
-  const gyroScale = profile === "short" ? 18 : profile === "fast" ? 43 : 30;
-  const gx = gyroScale * velocity + jerk * 95 + randomNoise() * 20;
-  const gy = gyroScale * 0.35 * direction + randomNoise() * 18;
-  const gz = gyroScale * 0.18 * velocity + jerk * 55 + randomNoise() * 18;
+  let ax = 0.08 * direction + jerk * 0.32 + randomNoise();
+  let ay = 0.05 * velocity + jerk * 0.18 + randomNoise();
+  let az = 1 + amplitude * smoothPulse + jerk + randomNoise();
+  let gyroScale = profile === "short" ? 18 : profile === "fast" ? 43 : 30;
+  if (mode === "weight_stack") {
+    ax = 0.02 * direction + randomNoise() * 0.55;
+    ay = 0.015 * velocity + randomNoise() * 0.55;
+    az = 1 + amplitude * smoothPulse + jerk + randomNoise();
+    gyroScale = profile === "clean" ? 1.4 : profile === "jerky" ? 18 : 7;
+  }
+  const gx = gyroScale * velocity + jerk * (mode === "weight_stack" ? 18 : 95) + randomNoise() * (mode === "weight_stack" ? 2 : 20);
+  const gy = gyroScale * 0.35 * direction + randomNoise() * (mode === "weight_stack" ? 2 : 18);
+  const gz = gyroScale * 0.18 * velocity + jerk * (mode === "weight_stack" ? 12 : 55) + randomNoise() * (mode === "weight_stack" ? 2 : 18);
   const line = [Math.round(elapsedMs), ax, ay, az, gx, gy, gz].join(",");
 
   processDataLine(line, "Demo");
@@ -544,6 +608,7 @@ function processDataLine(line, source) {
   if (samples.length % 8 === 0 || samples.length < 10) {
     liveAnalysis = analyzeRecordingByMode(samples, getSelectedExercise());
     elements.liveRepCount.textContent = String(liveAnalysis.reps);
+    updateLiveTrainingValues(liveAnalysis);
   }
   if (samples.length % 3 === 0 || samples.length < 5) {
     drawCharts();
@@ -577,6 +642,10 @@ async function startRecording(mode = "set") {
     liveAnalysis = emptyMetrics();
     recordingTimerId = window.setInterval(updateRecordingTime, 100);
     elements.recordingPreview.hidden = true;
+    elements.subjectiveSetPanel.hidden = true;
+    elements.setRpe.value = "";
+    elements.setRir.value = "";
+    elements.setNote.value = "";
     renderRecordingState();
     drawCharts();
   } catch (error) {
@@ -613,6 +682,8 @@ async function stopRecording(sendCommand = true) {
     rawSamples: samples.map(copySample),
     metrics: liveAnalysis,
     comparison: null,
+    subjective: normalizeSubjectiveSet(null),
+    session: { date: new Date().toISOString() },
   };
 
   if (type === "set" && exercise?.referenceRecording) {
@@ -640,11 +711,15 @@ function discardRecording() {
   recordedDurationMs = 0;
   liveAnalysis = emptyMetrics();
   resetLiveDisplay();
+  elements.subjectiveSetPanel.hidden = true;
+  elements.setRpe.value = "";
+  elements.setRir.value = "";
+  elements.setNote.value = "";
   renderRecordingState();
   drawCharts();
 }
 
-function startCalibration() {
+async function startCalibration() {
   clearMessage();
   const exercise = getSelectedExercise();
   if (!exercise) {
@@ -666,9 +741,27 @@ function startCalibration() {
   elements.calibrateButton.disabled = true;
   elements.calibrateButton.textContent = "3 s ruhig halten ...";
   showMessage("Sensor ruhig halten. Kalibrierung läuft 3 Sekunden.", "info");
+  if (isBluetoothConnected()) {
+    try {
+      await writeControlCommand("START\n");
+    } catch (error) {
+      calibrationActive = false;
+      elements.calibrateButton.textContent = "Sensor kalibrieren";
+      renderRecordingState();
+      showMessage(`Kalibrierung konnte nicht gestartet werden: ${friendlyError(error)}`);
+      return;
+    }
+  }
 
   window.clearTimeout(calibrationTimerId);
-  calibrationTimerId = window.setTimeout(() => {
+  calibrationTimerId = window.setTimeout(async () => {
+    if (isBluetoothConnected()) {
+      try {
+        await writeControlCommand("STOP\n");
+      } catch (error) {
+        showMessage(`Kalibrierung beendet, STOP konnte aber nicht gesendet werden: ${friendlyError(error)}`, "info", true);
+      }
+    }
     calibrationActive = false;
     const profile = calibrateSensor(calibrationSamples);
     if (!profile) {
@@ -701,6 +794,16 @@ function saveRecording() {
     return;
   }
 
+  pendingRecording.subjective = readSubjectiveSetInputs();
+  pendingRecording.session = {
+    date: new Date().toISOString(),
+    exerciseId: exercise.id,
+    exerciseName: exercise.name,
+    weight: exercise.weight,
+    targetReps: exercise.targetReps,
+    setType: exercise.setType,
+  };
+
   if (exercise.referenceRecording) {
     pendingRecording.comparison = compareRecordingToReference(
       pendingRecording,
@@ -715,15 +818,21 @@ function saveRecording() {
     pendingRecording.comparison = {
       overallScore: null,
       feedbackMessages: ["Keine Referenz vorhanden. Der Satz wurde ohne Referenzvergleich gespeichert."],
+      feedbackEvents: buildFeedbackEvents(pendingRecording.metrics, null),
     };
   }
 
   exercise.setRecordings.push(pendingRecording);
+  addSetToSession(exercise, pendingRecording);
   saveState();
   showMessage(`${pendingRecording.name} wurde gespeichert.`, "success");
   const savedId = pendingRecording.id;
   pendingRecording = null;
   recordingMode = null;
+  elements.subjectiveSetPanel.hidden = true;
+  elements.setRpe.value = "";
+  elements.setRir.value = "";
+  elements.setNote.value = "";
   selectedAnalysisRecordingIds.add(savedId);
   renderAll();
 }
@@ -743,10 +852,14 @@ function saveReference() {
 
   pendingRecording.name = "Referenz";
   pendingRecording.metrics = analyzeRecordingByMode(pendingRecording.rawSamples, exercise);
+  pendingRecording.metrics.referenceQuality = assessReferenceQuality(pendingRecording.metrics);
   pendingRecording.metrics.movementQualityScore = Math.round(
     (pendingRecording.metrics.smoothnessScore + pendingRecording.metrics.tempoConsistencyScore) / 2,
   );
   exercise.referenceRecording = pendingRecording;
+  if (pendingRecording.metrics.referenceQuality.status !== "good") {
+    showMessage(`Referenz ungleichmäßig, bitte ggf. neu aufnehmen: ${pendingRecording.metrics.referenceQuality.issues.join(", ")}`, "info", true);
+  }
 
   // Bestehende Sätze werden mit der neuen Referenz neu bewertet.
   exercise.setRecordings.forEach((setRecording) => {
@@ -795,301 +908,8 @@ function copySample(sample) {
 // ---------------------------------------------------------------------------
 // Analyse, Rep-Erkennung und Referenzvergleich
 // ---------------------------------------------------------------------------
-
-function emptyMetrics() {
-  return {
-    reps: 0,
-    durationMs: 0,
-    avgRepDurationMs: 0,
-    avgAccMagnitude: 0,
-    maxAccMagnitude: 0,
-    avgGyroMagnitude: 0,
-    maxGyroMagnitude: 0,
-    amplitudeEstimate: 0,
-    smoothnessScore: 0,
-    tempoConsistencyScore: 0,
-    movementQualityScore: 0,
-    repTimestamps: [],
-    repSegments: [],
-    repAmplitudes: [],
-  };
-}
-
-function analyzeRecording(inputSamples) {
-  if (!Array.isArray(inputSamples) || inputSamples.length === 0) {
-    return emptyMetrics();
-  }
-
-  const data = inputSamples.filter((sample) =>
-    Number.isFinite(sample.timestamp) &&
-    Number.isFinite(sample.accMagnitude) &&
-    Number.isFinite(sample.gyroMagnitude),
-  );
-  if (data.length === 0) return emptyMetrics();
-
-  const durationMs = getSampleDuration(data);
-  const accValues = data.map((sample) => sample.accMagnitude);
-  const gyroValues = data.map((sample) => sample.gyroMagnitude);
-  const sampleIntervalMs = estimateSampleInterval(data);
-  const shortWindow = Math.max(3, Math.round(180 / sampleIntervalMs));
-  const baselineWindow = Math.max(shortWindow + 2, Math.round(1000 / sampleIntervalMs));
-  const smoothedAcc = movingAverage(accValues, shortWindow);
-  const baseline = movingAverage(accValues, baselineWindow);
-  const positiveMotion = smoothedAcc.map((value, index) => Math.max(0, value - baseline[index]));
-  const motionEnvelope = movingAverage(positiveMotion, Math.max(2, Math.round(100 / sampleIntervalMs)));
-  const motionMean = average(motionEnvelope);
-  const motionStd = standardDeviation(motionEnvelope);
-  const adaptiveThreshold = Math.max(0.035, motionMean + motionStd * 0.6);
-  const minimumRepDistanceMs = 500;
-  const peakIndices = [];
-
-  for (let index = 2; index < motionEnvelope.length - 2; index += 1) {
-    const isLocalPeak =
-      motionEnvelope[index] >= motionEnvelope[index - 1] &&
-      motionEnvelope[index] > motionEnvelope[index + 1] &&
-      motionEnvelope[index] >= motionEnvelope[index - 2] &&
-      motionEnvelope[index] >= motionEnvelope[index + 2];
-    if (!isLocalPeak || motionEnvelope[index] < adaptiveThreshold) continue;
-
-    const previousPeakIndex = peakIndices[peakIndices.length - 1];
-    if (
-      previousPeakIndex === undefined ||
-      data[index].timestamp - data[previousPeakIndex].timestamp >= minimumRepDistanceMs
-    ) {
-      peakIndices.push(index);
-    } else if (motionEnvelope[index] > motionEnvelope[previousPeakIndex]) {
-      peakIndices[peakIndices.length - 1] = index;
-    }
-  }
-
-  // Fallback für Bewegungen, deren Magnitude überwiegend unter den lokalen
-  // Basiswert fällt. Weiterhin wird accMagnitude als Primärsignal verwendet.
-  if (peakIndices.length === 0 && motionStd > 0.02) {
-    const absoluteMotion = smoothedAcc.map((value, index) => Math.abs(value - baseline[index]));
-    const fallbackEnvelope = movingAverage(absoluteMotion, Math.max(2, Math.round(120 / sampleIntervalMs)));
-    const threshold = Math.max(0.045, average(fallbackEnvelope) + standardDeviation(fallbackEnvelope) * 0.8);
-    for (let index = 2; index < fallbackEnvelope.length - 2; index += 1) {
-      if (
-        fallbackEnvelope[index] >= threshold &&
-        fallbackEnvelope[index] > fallbackEnvelope[index - 1] &&
-        fallbackEnvelope[index] >= fallbackEnvelope[index + 1]
-      ) {
-        const previous = peakIndices[peakIndices.length - 1];
-        if (previous === undefined || data[index].timestamp - data[previous].timestamp >= minimumRepDistanceMs) {
-          peakIndices.push(index);
-        }
-      }
-    }
-  }
-
-  const repTimestamps = peakIndices.map((index) => data[index].timestamp);
-  const repSegments = createRepSegments(peakIndices, data);
-  const repIntervals = repTimestamps.slice(1).map((timestamp, index) => timestamp - repTimestamps[index]);
-  const avgRepDurationMs = repIntervals.length
-    ? average(repIntervals)
-    : peakIndices.length === 1
-      ? durationMs
-      : 0;
-  const repAmplitudes = repSegments.map((segment) => {
-    const values = accValues.slice(segment.startIndex, segment.endIndex + 1);
-    return Math.max(0, percentile(values, 0.95) - percentile(values, 0.1));
-  });
-  const amplitudeEstimate = repAmplitudes.length
-    ? average(repAmplitudes)
-    : Math.max(0, percentile(accValues, 0.95) - percentile(accValues, 0.1));
-
-  const residuals = accValues.map((value, index) => value - smoothedAcc[index]);
-  const signalSpread = Math.max(standardDeviation(smoothedAcc), 0.02);
-  const noiseRatio = standardDeviation(residuals) / signalSpread;
-  const velocity = smoothedAcc.slice(1).map(
-    (value, index) => (value - smoothedAcc[index]) / Math.max(sampleIntervalMs / 1000, 0.001),
-  );
-  const velocityVariation = standardDeviation(velocity) / Math.max(amplitudeEstimate, 0.04);
-  const smoothnessScore = Math.round(clamp(100 - noiseRatio * 58 - velocityVariation * 1.5, 0, 100));
-
-  let tempoConsistencyScore = 0;
-  if (repIntervals.length >= 2) {
-    const coefficientOfVariation =
-      standardDeviation(repIntervals) / Math.max(average(repIntervals), 1);
-    tempoConsistencyScore = Math.round(clamp(100 - coefficientOfVariation * 240, 0, 100));
-  } else if (peakIndices.length === 1) {
-    tempoConsistencyScore = 55;
-  }
-
-  const movementQualityScore = Math.round(
-    clamp(smoothnessScore * 0.55 + tempoConsistencyScore * 0.45, 0, 100),
-  );
-
-  return {
-    reps: peakIndices.length,
-    durationMs,
-    avgRepDurationMs: Math.round(avgRepDurationMs),
-    avgAccMagnitude: average(accValues),
-    maxAccMagnitude: Math.max(...accValues),
-    avgGyroMagnitude: average(gyroValues),
-    maxGyroMagnitude: Math.max(...gyroValues),
-    amplitudeEstimate,
-    smoothnessScore,
-    tempoConsistencyScore,
-    movementQualityScore,
-    repTimestamps,
-    repSegments,
-    repAmplitudes,
-  };
-}
-
-function createRepSegments(peakIndices, data) {
-  return peakIndices.map((peakIndex, index) => {
-    const previousPeak = peakIndices[index - 1];
-    const nextPeak = peakIndices[index + 1];
-    const startIndex = previousPeak === undefined ? 0 : Math.floor((previousPeak + peakIndex) / 2);
-    const endIndex = nextPeak === undefined
-      ? data.length - 1
-      : Math.floor((peakIndex + nextPeak) / 2);
-    return {
-      startIndex,
-      peakIndex,
-      endIndex,
-      startTimestamp: data[startIndex].timestamp,
-      peakTimestamp: data[peakIndex].timestamp,
-      endTimestamp: data[endIndex].timestamp,
-    };
-  });
-}
-
-function compareRecordingToReference(currentRecording, referenceRecording) {
-  const currentMetrics = currentRecording.metrics || analyzeRecording(currentRecording.rawSamples);
-  const referenceMetrics = referenceRecording.metrics || analyzeRecording(referenceRecording.rawSamples);
-  const tooLittleData =
-    currentRecording.rawSamples.length < MIN_ANALYSIS_SAMPLES ||
-    referenceRecording.rawSamples.length < MIN_ANALYSIS_SAMPLES;
-
-  const accCurveError = normalizedCurveRmse(
-    currentRecording.rawSamples,
-    referenceRecording.rawSamples,
-    "accMagnitude",
-  );
-  const gyroCurveError = normalizedCurveRmse(
-    currentRecording.rawSamples,
-    referenceRecording.rawSamples,
-    "gyroMagnitude",
-  );
-  const accCurveScore = errorToScore(accCurveError);
-  const gyroCurveScore = errorToScore(gyroCurveError);
-  const repCountDiff = currentMetrics.reps - referenceMetrics.reps;
-  const repScore = percentSimilarity(currentMetrics.reps, referenceMetrics.reps);
-  const repDurationScore = percentSimilarity(
-    currentMetrics.avgRepDurationMs,
-    referenceMetrics.avgRepDurationMs,
-  );
-  const amplitudeScore = percentSimilarity(
-    currentMetrics.amplitudeEstimate,
-    referenceMetrics.amplitudeEstimate,
-  );
-  const durationDiffPercent = percentDifference(
-    currentMetrics.durationMs,
-    referenceMetrics.durationMs,
-  );
-  const avgRepDurationDiffPercent = percentDifference(
-    currentMetrics.avgRepDurationMs,
-    referenceMetrics.avgRepDurationMs,
-  );
-  const amplitudeDiffPercent = percentDifference(
-    currentMetrics.amplitudeEstimate,
-    referenceMetrics.amplitudeEstimate,
-  );
-  const smoothnessDiffPercent = percentDifference(
-    currentMetrics.smoothnessScore,
-    referenceMetrics.smoothnessScore,
-  );
-  const tempoConsistencyDiffPercent = percentDifference(
-    currentMetrics.tempoConsistencyScore,
-    referenceMetrics.tempoConsistencyScore,
-  );
-
-  let overallScore = Math.round(
-    accCurveScore * 0.35 +
-    gyroCurveScore * 0.2 +
-    repScore * 0.15 +
-    repDurationScore * 0.15 +
-    amplitudeScore * 0.15,
-  );
-  if (tooLittleData) overallScore = Math.min(overallScore, 35);
-
-  const feedbackMessages = [];
-  if (tooLittleData) {
-    feedbackMessages.push("Datenmenge zu gering für eine sinnvolle Analyse.");
-  } else if (overallScore >= 82) {
-    feedbackMessages.push("Sehr ähnlich zur Referenz.");
-  } else if (overallScore >= 65) {
-    feedbackMessages.push("Die Ausführung ist insgesamt ähnlich zur Referenz.");
-  } else {
-    feedbackMessages.push("Die Ausführung weicht deutlich von der Referenz ab.");
-  }
-
-  if (repCountDiff < 0) {
-    feedbackMessages.push("Du hast weniger Wiederholungen als in der Referenz ausgeführt.");
-  } else if (repCountDiff > 0) {
-    feedbackMessages.push("Du hast mehr Wiederholungen als in der Referenz ausgeführt.");
-  }
-  if (avgRepDurationDiffPercent < -15) {
-    feedbackMessages.push("Die Bewegung war deutlich schneller als die Referenz.");
-  } else if (avgRepDurationDiffPercent > 18) {
-    feedbackMessages.push("Die Bewegung war deutlich langsamer als die Referenz.");
-  }
-  if (amplitudeDiffPercent < -15) {
-    feedbackMessages.push("Die Bewegungsamplitude ist geringer als in der Referenz.");
-  } else if (amplitudeDiffPercent > 22) {
-    feedbackMessages.push("Die Bewegungsamplitude ist größer als in der Referenz.");
-  }
-  if (smoothnessDiffPercent < -12) {
-    feedbackMessages.push("Die Bewegung war ruckartiger als die Referenz.");
-  }
-  if (tempoConsistencyDiffPercent < -15) {
-    feedbackMessages.push("Das Wiederholungstempo war ungleichmäßiger als in der Referenz.");
-  }
-  if (detectEndFatigue(currentMetrics)) {
-    feedbackMessages.push("Die letzten Wiederholungen wirken ungleichmäßiger oder kürzer.");
-  }
-  if (feedbackMessages.length === 1 && overallScore >= 82) {
-    feedbackMessages.push("Tempo, Amplitude und Kurvenverlauf liegen nah an der Vorlage.");
-  }
-
-  return {
-    overallScore,
-    repCountDiff,
-    durationDiffPercent,
-    avgRepDurationDiffPercent,
-    amplitudeDiffPercent,
-    smoothnessDiffPercent,
-    tempoConsistencyDiffPercent,
-    accCurveError,
-    gyroCurveError,
-    feedbackMessages,
-  };
-}
-
-function detectEndFatigue(metrics) {
-  const amplitudes = metrics.repAmplitudes || [];
-  if (amplitudes.length < 4) return false;
-  const groupSize = Math.max(2, Math.floor(amplitudes.length / 3));
-  const first = average(amplitudes.slice(0, groupSize));
-  const last = average(amplitudes.slice(-groupSize));
-  return last < first * 0.84;
-}
-
-function normalizedCurveRmse(currentSamples, referenceSamples, property) {
-  if (!currentSamples?.length || !referenceSamples?.length) return 2;
-  const current = resampleProperty(currentSamples, property, OVERLAY_POINT_COUNT);
-  const reference = resampleProperty(referenceSamples, property, OVERLAY_POINT_COUNT);
-  const referenceRange = percentile(reference, 0.95) - percentile(reference, 0.05);
-  const scale = Math.max(referenceRange, standardDeviation(reference), Math.abs(average(reference)) * 0.08, 0.01);
-  const squaredError = current.reduce(
-    (sum, value, index) => sum + (value - reference[index]) ** 2,
-    0,
-  );
-  return Math.sqrt(squaredError / current.length) / scale;
-}
+// Gemeinsame Analyse-Helfer
+// ---------------------------------------------------------------------------
 
 function errorToScore(error) {
   return clamp(100 * Math.exp(-Math.max(0, error) * 0.9), 0, 100);
@@ -1103,21 +923,6 @@ function percentSimilarity(current, reference) {
 function percentDifference(current, reference) {
   if (!reference) return current ? 100 : 0;
   return ((current - reference) / Math.abs(reference)) * 100;
-}
-
-function movingAverage(values, windowSize) {
-  const result = new Array(values.length);
-  let sum = 0;
-  const half = Math.floor(windowSize / 2);
-  const prefix = [0];
-  values.forEach((value) => prefix.push(prefix[prefix.length - 1] + value));
-  for (let index = 0; index < values.length; index += 1) {
-    const start = Math.max(0, index - half);
-    const end = Math.min(values.length - 1, index + half);
-    sum = prefix[end + 1] - prefix[start];
-    result[index] = sum / (end - start + 1);
-  }
-  return result;
 }
 
 function estimateSampleInterval(data) {
@@ -1135,55 +940,20 @@ function getSampleDuration(data) {
   return Math.max(0, data[data.length - 1].timestamp - data[0].timestamp);
 }
 
-function average(values) {
-  return values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : 0;
-}
-
-function standardDeviation(values) {
-  if (!values.length) return 0;
-  const mean = average(values);
-  return Math.sqrt(average(values.map((value) => (value - mean) ** 2)));
-}
-
 function percentile(values, fraction) {
-  if (!values.length) return 0;
-  const sorted = [...values].sort((a, b) => a - b);
-  const position = clamp(fraction, 0, 1) * (sorted.length - 1);
+  const valid = values.filter(Number.isFinite).sort((a, b) => a - b);
+  if (!valid.length) return 0;
+  const position = clamp(fraction, 0, 1) * (valid.length - 1);
   const lower = Math.floor(position);
   const upper = Math.ceil(position);
-  if (lower === upper) return sorted[lower];
+  if (lower === upper) return valid[lower];
   const weight = position - lower;
-  return sorted[lower] * (1 - weight) + sorted[upper] * weight;
+  return valid[lower] * (1 - weight) + valid[upper] * weight;
 }
 
 function clamp(value, minimum, maximum) {
   return Math.min(maximum, Math.max(minimum, value));
 }
-
-function resampleProperty(data, property, targetLength) {
-  if (!data.length || targetLength <= 0) return [];
-  if (data.length === 1) return new Array(targetLength).fill(Number(data[0][property]) || 0);
-  const result = [];
-  for (let index = 0; index < targetLength; index += 1) {
-    const position = (index * (data.length - 1)) / Math.max(targetLength - 1, 1);
-    const lower = Math.floor(position);
-    const upper = Math.min(data.length - 1, Math.ceil(position));
-    const weight = position - lower;
-    const lowerValue = Number(data[lower][property]) || 0;
-    const upperValue = Number(data[upper][property]) || 0;
-    result.push(lowerValue * (1 - weight) + upperValue * weight);
-  }
-  return result;
-}
-
-// ---------------------------------------------------------------------------
-// Übungsverwaltung
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Mode-basierte Analyse-Pipeline
-// ---------------------------------------------------------------------------
-
 function emptyMetrics() {
   return {
     analysisMode: "free_movement",
@@ -1205,6 +975,25 @@ function emptyMetrics() {
     gyroStabilityScore: 0,
     tremorScore: 0,
     movementQualityScore: 0,
+    cleanRepCount: 0,
+    warningRepCount: 0,
+    badRepCount: 0,
+    uncertainRepCount: 0,
+    firstBadRep: null,
+    mainIssue: "—",
+    velocityLossPercent: 0,
+    recommendation: {
+      action: "technique_focus",
+      label: "Technikfokus",
+      message: "Noch keine belastbare Trainingsaussage.",
+      reasons: [],
+    },
+    sensorQuality: {
+      status: "uncertain",
+      issues: [],
+      sampleRateHz: 0,
+    },
+    referenceQuality: null,
     repTimestamps: [],
     repSegments: [],
     repMetrics: [],
@@ -1296,7 +1085,11 @@ function analyzeFreeMovement(inputSamples, exercise) {
 
 function analyzeMode(inputSamples, exercise, config) {
   const prepared = prepareModeSignals(inputSamples, exercise, config);
-  const repMarkers = detectReps(prepared.filteredPrimary, prepared.timestamps);
+  const sensorQuality = validateSampleRate(prepared.samples, config.mode);
+  const repMarkers = detectRepsCycleBased(prepared.filteredPrimary, prepared.timestamps, {
+    minimumRepDurationMs: 700,
+    minimumRestMs: 120,
+  });
   const repSegments = segmentReps(prepared.samples, repMarkers).map((segment) => ({
     ...segment,
     primary: prepared.filteredPrimary.slice(segment.startIndex, segment.endIndex + 1),
@@ -1306,6 +1099,10 @@ function analyzeMode(inputSamples, exercise, config) {
     jerk: prepared.jerk.slice(segment.startIndex, Math.max(segment.startIndex, segment.endIndex)),
   }));
   const repMetrics = calculateRepMetrics(repSegments, config.mode);
+  const referenceRepMetrics = exercise?.referenceRecording?.metrics?.repMetrics || [];
+  applyVelocityLoss(repMetrics);
+  applyRomRelativeToReference(repMetrics, referenceRepMetrics);
+  const qualitySummary = classifyCleanReps(repMetrics, referenceRepMetrics, config.mode, sensorQuality);
   const fatigue = detectFatigue(repMetrics, exercise?.referenceRecording?.metrics?.repMetrics || []);
   const repDurations = repMetrics.map((rep) => rep.durationMs).filter((value) => value > 0);
   const repAmplitudes = repMetrics.map((rep) => rep.amplitudeProxy);
@@ -1330,6 +1127,20 @@ function analyzeMode(inputSamples, exercise, config) {
     0,
     100,
   ));
+  const preliminaryAnalysis = {
+    ...emptyMetrics(),
+    reps: repMetrics.length,
+    cleanRepCount: qualitySummary.clean,
+    warningRepCount: qualitySummary.warning,
+    badRepCount: qualitySummary.bad,
+    uncertainRepCount: qualitySummary.uncertain,
+    firstBadRep: qualitySummary.firstBadRep,
+    mainIssue: qualitySummary.mainIssue,
+    velocityLossPercent: qualitySummary.velocityLossPercent,
+    fatigue,
+    sensorQuality,
+  };
+  const recommendation = generateTrainingRecommendation(preliminaryAnalysis, null, exercise);
 
   return {
     ...emptyMetrics(),
@@ -1351,7 +1162,16 @@ function analyzeMode(inputSamples, exercise, config) {
     gyroStabilityScore,
     tremorScore,
     movementQualityScore,
-    repTimestamps: repMarkers.map((index) => prepared.samples[index]?.timestamp).filter(Number.isFinite),
+    cleanRepCount: qualitySummary.clean,
+    warningRepCount: qualitySummary.warning,
+    badRepCount: qualitySummary.bad,
+    uncertainRepCount: qualitySummary.uncertain,
+    firstBadRep: qualitySummary.firstBadRep,
+    mainIssue: qualitySummary.mainIssue,
+    velocityLossPercent: qualitySummary.velocityLossPercent,
+    recommendation,
+    sensorQuality,
+    repTimestamps: repMarkers.map((marker) => prepared.samples[marker.peakIndex]?.timestamp).filter(Number.isFinite),
     repSegments: repSegments.map(({ startIndex, peakIndex, endIndex, startTimestamp, peakTimestamp, endTimestamp }) => ({
       startIndex,
       peakIndex,
@@ -1363,7 +1183,7 @@ function analyzeMode(inputSamples, exercise, config) {
     repMetrics,
     repAmplitudes,
     fatigue,
-    feedbackEvents: buildMetricEvents(repMetrics, fatigue, config.mode),
+    feedbackEvents: buildFeedbackEvents({ repMetrics, fatigue, sensorQuality }, null),
     signals: {
       primary: prepared.filteredPrimary,
       secondary: prepared.secondary,
@@ -1432,11 +1252,24 @@ function determineDominantAxis(inputSamples, calibrationProfile) {
     .sort((a, b) => b.spread - a.spread)[0]?.axis || "az";
 }
 
-function lowPassFilter(values, alpha = 0.14) {
+function lowPassFilter(values, alpha = 0.15) {
   if (!values.length) return [];
   const result = [values[0]];
   for (let index = 1; index < values.length; index += 1) {
     result[index] = result[index - 1] + alpha * (values[index] - result[index - 1]);
+  }
+  return result;
+}
+
+function movingAverage(values, windowSize) {
+  const result = new Array(values.length);
+  const half = Math.floor(Math.max(1, windowSize) / 2);
+  const prefix = [0];
+  values.forEach((value) => prefix.push(prefix[prefix.length - 1] + value));
+  for (let index = 0; index < values.length; index += 1) {
+    const start = Math.max(0, index - half);
+    const end = Math.min(values.length - 1, index + half);
+    result[index] = (prefix[end + 1] - prefix[start]) / (end - start + 1);
   }
   return result;
 }
@@ -1459,28 +1292,75 @@ function calculateJerk(values, timestamps) {
   return result;
 }
 
-function detectReps(signal, timestamps) {
+function detectRepsCycleBased(signal, timestamps, options = {}) {
   if (!signal.length) return [];
-  const baseline = movingAverage(signal, Math.max(9, Math.round(1000 / estimateIntervalFromTimestamps(timestamps))));
-  const envelope = movingAverage(signal.map((value, index) => Math.abs(value - baseline[index])), 5);
-  const threshold = Math.max(0.035, average(envelope) + standardDeviation(envelope) * 0.62);
-  const peaks = [];
-  for (let index = 2; index < envelope.length - 2; index += 1) {
-    const isPeak = envelope[index] >= envelope[index - 1] && envelope[index] > envelope[index + 1] && envelope[index] >= envelope[index - 2] && envelope[index] >= envelope[index + 2];
-    if (!isPeak || envelope[index] < threshold) continue;
-    const previous = peaks.at(-1);
-    if (previous === undefined || timestamps[index] - timestamps[previous] >= 700) peaks.push(index);
-    else if (envelope[index] > envelope[previous]) peaks[peaks.length - 1] = index;
+  const minimumRepDurationMs = options.minimumRepDurationMs || 700;
+  const minimumRestMs = options.minimumRestMs || 120;
+  const baseline = movingAverage(signal, Math.max(9, Math.round(900 / estimateIntervalFromTimestamps(timestamps))));
+  const centered = signal.map((value, index) => value - baseline[index]);
+  const envelope = movingAverage(centered.map(Math.abs), 5);
+  const threshold = Math.max(0.035, average(envelope) + standardDeviation(envelope) * 0.55);
+  const restThreshold = threshold * 0.45;
+  const markers = [];
+  let state = "rest";
+  let startIndex = 0;
+  let peakIndex = 0;
+  let peakAbs = 0;
+  let restCandidateIndex = null;
+
+  for (let index = 1; index < envelope.length; index += 1) {
+    if (state === "rest" && envelope[index] > threshold) {
+      state = "moving";
+      startIndex = Math.max(0, index - 1);
+      peakIndex = index;
+      peakAbs = envelope[index];
+      restCandidateIndex = null;
+      continue;
+    }
+
+    if (state !== "moving") continue;
+    if (envelope[index] > peakAbs) {
+      peakAbs = envelope[index];
+      peakIndex = index;
+    }
+
+    if (envelope[index] <= restThreshold) {
+      if (restCandidateIndex === null) restCandidateIndex = index;
+      const restDuration = timestamps[index] - timestamps[restCandidateIndex];
+      const repDuration = timestamps[index] - timestamps[startIndex];
+      if (restDuration >= minimumRestMs && repDuration >= minimumRepDurationMs) {
+        markers.push({
+          startIndex,
+          peakIndex,
+          endIndex: index,
+          direction: Math.sign(centered[peakIndex]) || 1,
+        });
+        state = "rest";
+        restCandidateIndex = null;
+      }
+    } else {
+      restCandidateIndex = null;
+    }
   }
-  return peaks;
+
+  return markers;
+}
+
+function detectReps(signal, timestamps, options = {}) {
+  return detectRepsCycleBased(signal, timestamps, options);
 }
 
 function segmentReps(inputSamples, repMarkers) {
-  return repMarkers.map((peakIndex, index) => {
-    const previousPeak = repMarkers[index - 1];
-    const nextPeak = repMarkers[index + 1];
-    const startIndex = previousPeak === undefined ? 0 : Math.floor((previousPeak + peakIndex) / 2);
-    const endIndex = nextPeak === undefined ? inputSamples.length - 1 : Math.floor((peakIndex + nextPeak) / 2);
+  return repMarkers.map((marker, index) => {
+    const peakIndex = Number.isFinite(marker?.peakIndex) ? marker.peakIndex : marker;
+    const previousPeak = Number.isFinite(repMarkers[index - 1]?.peakIndex) ? repMarkers[index - 1].peakIndex : repMarkers[index - 1];
+    const nextPeak = Number.isFinite(repMarkers[index + 1]?.peakIndex) ? repMarkers[index + 1].peakIndex : repMarkers[index + 1];
+    const startIndex = Number.isFinite(marker?.startIndex)
+      ? marker.startIndex
+      : previousPeak === undefined ? 0 : Math.floor((previousPeak + peakIndex) / 2);
+    const endIndex = Number.isFinite(marker?.endIndex)
+      ? marker.endIndex
+      : nextPeak === undefined ? inputSamples.length - 1 : Math.floor((peakIndex + nextPeak) / 2);
     return {
       startIndex,
       peakIndex,
@@ -1495,6 +1375,8 @@ function segmentReps(inputSamples, repMarkers) {
 function calculateRepMetrics(repSegments, mode) {
   return repSegments.map((segment, index) => {
     const amplitudeProxy = Math.max(0, percentile(segment.primary, 0.95) - percentile(segment.primary, 0.05));
+    const durationMs = Math.max(0, segment.endTimestamp - segment.startTimestamp);
+    const velocityProxy = amplitudeProxy / Math.max(durationMs / 1000, 0.001);
     const highFrequencyRms = rms(segment.highFrequency);
     const jerkRms = rms(segment.jerk);
     const tremorScore = highFrequencyRms + jerkRms * 0.015;
@@ -1507,22 +1389,147 @@ function calculateRepMetrics(repSegments, mode) {
     const barTiltScore = Math.round(clamp(100 - maxTiltProxy * 0.55, 0, 100));
     return {
       repNumber: index + 1,
+      repIndex: index,
       startTime: segment.startTimestamp,
       endTime: segment.endTimestamp,
-      durationMs: Math.max(0, segment.endTimestamp - segment.startTimestamp),
+      durationMs,
+      concentricDurationProxy: durationMs ? Math.round(durationMs * 0.5) : 0,
+      eccentricDurationProxy: durationMs ? Math.round(durationMs * 0.5) : 0,
       peakValue: segment.primary.length ? Math.max(...segment.primary.map(Math.abs)) : 0,
       amplitudeProxy,
       ROMProxy: amplitudeProxy,
+      romRelativeToReference: null,
+      velocityProxy,
+      velocityLossPercent: 0,
       smoothnessScore,
       jerkScore: jerkRms,
       tremorScore,
       gyroStabilityScore,
       barTiltScore,
       maxTiltProxy,
+      tiltProxy: maxTiltProxy,
+      curveSimilarity: null,
+      qualityClass: "uncertain",
+      qualityReasons: [],
       leftRightImbalanceProxy: mode === "barbell" ? maxTiltProxy : null,
       wobbleScore: mode === "barbell" ? 100 - barTiltScore : 100 - gyroStabilityScore,
     };
   });
+}
+
+function validateSampleRate(inputSamples, mode = "free_movement") {
+  const intervals = [];
+  for (let index = 1; index < inputSamples.length; index += 1) {
+    const interval = inputSamples[index].timestamp - inputSamples[index - 1].timestamp;
+    if (interval > 0 && interval < 1000) intervals.push(interval);
+  }
+  const medianInterval = intervals.length ? percentile(intervals, 0.5) : 0;
+  const sampleRateHz = medianInterval ? 1000 / medianInterval : 0;
+  const jitterRatio = intervals.length ? standardDeviation(intervals) / Math.max(average(intervals), 1) : 1;
+  const gyroValues = inputSamples.map((sample) => Math.hypot(sample.gx, sample.gy, sample.gz));
+  const accSpread = Math.max(
+    standardDeviation(inputSamples.map((sample) => sample.ax)),
+    standardDeviation(inputSamples.map((sample) => sample.ay)),
+    standardDeviation(inputSamples.map((sample) => sample.az)),
+  );
+  const issues = [];
+  if (inputSamples.length < MIN_ANALYSIS_SAMPLES) issues.push("Zu wenige Samples");
+  if (sampleRateHz && (sampleRateHz < 35 || sampleRateHz > 70)) issues.push("Datenrate außerhalb des erwarteten 50-Hz-Bereichs");
+  if (jitterRatio > 0.22) issues.push("Datenrate schwankt deutlich");
+  if (accSpread < 0.025) issues.push("Bewegungssignal sehr klein");
+  if (mode === "weight_stack" && percentile(gyroValues, 0.9) > 35) issues.push("Gyro beim Gewichtsblock ungewöhnlich hoch");
+  return {
+    status: issues.length ? "uncertain" : "good",
+    issues,
+    sampleRateHz,
+    jitterRatio,
+  };
+}
+
+function assessReferenceQuality(metrics) {
+  const issues = [];
+  if (metrics.durationMs < 1500 || metrics.repMetrics.length < 3) issues.push("mindestens 3 saubere Reps empfohlen");
+  const amplitudes = metrics.repMetrics.map((rep) => rep.amplitudeProxy).filter(Boolean);
+  const durations = metrics.repMetrics.map((rep) => rep.durationMs).filter(Boolean);
+  const tremors = metrics.repMetrics.map((rep) => rep.tremorScore).filter(Number.isFinite);
+  if (amplitudes.length >= 3 && standardDeviation(amplitudes) / Math.max(average(amplitudes), 0.001) > 0.22) issues.push("ROM ungleichmäßig");
+  if (durations.length >= 3 && standardDeviation(durations) / Math.max(average(durations), 1) > 0.22) issues.push("Rep-Dauer schwankt");
+  if (average(tremors) > 1.6) issues.push("Ruckeln/Zittern erhöht");
+  if (metrics.sensorQuality?.status !== "good") issues.push("Messqualität unsicher");
+  return {
+    status: issues.length ? "warning" : "good",
+    issues,
+  };
+}
+
+function applyVelocityLoss(repMetrics) {
+  const baseline = average(repMetrics.slice(0, Math.min(3, repMetrics.length)).map((rep) => rep.velocityProxy).filter(Boolean));
+  repMetrics.forEach((rep) => {
+    rep.velocityLossPercent = baseline ? clamp(((baseline - rep.velocityProxy) / baseline) * 100, -100, 100) : 0;
+  });
+}
+
+function applyRomRelativeToReference(repMetrics, referenceRepMetrics = []) {
+  const referenceRom = average(referenceRepMetrics.map((rep) => rep.amplitudeProxy).filter(Boolean));
+  repMetrics.forEach((rep) => {
+    rep.romRelativeToReference = referenceRom ? clamp((rep.amplitudeProxy / referenceRom) * 100, 0, 200) : null;
+  });
+}
+
+function classifyCleanReps(repMetrics, referenceMetrics = [], mode = "free_movement", sensorQuality = { status: "good" }) {
+  const reference = {
+    amplitude: average(referenceMetrics.map((rep) => rep.amplitudeProxy).filter(Boolean)),
+    duration: average(referenceMetrics.map((rep) => rep.durationMs).filter(Boolean)),
+    tremor: average(referenceMetrics.map((rep) => rep.tremorScore).filter(Number.isFinite)),
+    smoothness: average(referenceMetrics.map((rep) => rep.smoothnessScore).filter(Number.isFinite)),
+    stability: average(referenceMetrics.map((rep) => rep.gyroStabilityScore).filter(Number.isFinite)),
+  };
+  const first = {
+    amplitude: average(repMetrics.slice(0, 3).map((rep) => rep.amplitudeProxy).filter(Boolean)),
+    duration: average(repMetrics.slice(0, 3).map((rep) => rep.durationMs).filter(Boolean)),
+    tremor: average(repMetrics.slice(0, 3).map((rep) => rep.tremorScore).filter(Number.isFinite)),
+    smoothness: average(repMetrics.slice(0, 3).map((rep) => rep.smoothnessScore).filter(Number.isFinite)),
+    stability: average(repMetrics.slice(0, 3).map((rep) => rep.gyroStabilityScore).filter(Number.isFinite)),
+  };
+  const robust = {
+    amplitude: percentile(repMetrics.map((rep) => rep.amplitudeProxy).filter(Boolean), 0.5),
+    duration: percentile(repMetrics.map((rep) => rep.durationMs).filter(Boolean), 0.5),
+    tremor: percentile(repMetrics.map((rep) => rep.tremorScore).filter(Number.isFinite), 0.5),
+    smoothness: percentile(repMetrics.map((rep) => rep.smoothnessScore).filter(Number.isFinite), 0.5),
+    stability: percentile(repMetrics.map((rep) => rep.gyroStabilityScore).filter(Number.isFinite), 0.5),
+  };
+  const hasReference = referenceMetrics.length >= 3;
+  const basis = {
+    amplitude: hasReference ? reference.amplitude : robust.amplitude || first.amplitude,
+    duration: hasReference ? reference.duration : robust.duration || first.duration,
+    tremor: hasReference ? reference.tremor : robust.tremor || first.tremor,
+    smoothness: hasReference ? reference.smoothness : robust.smoothness || first.smoothness,
+    stability: hasReference ? reference.stability : robust.stability || first.stability,
+  };
+  const counts = { clean: 0, warning: 0, bad: 0, uncertain: 0 };
+  const issueCounts = new Map();
+  let firstBadRep = null;
+  repMetrics.forEach((rep) => {
+    const reasons = [];
+    if (basis.amplitude && rep.amplitudeProxy < basis.amplitude * 0.85) reasons.push("ROM");
+    if (basis.duration && (rep.durationMs > basis.duration * 1.2 || rep.velocityLossPercent > 20)) reasons.push("Tempo");
+    if (basis.tremor && rep.tremorScore > basis.tremor * 1.3) reasons.push("Ruckeln");
+    if (basis.smoothness && rep.smoothnessScore < basis.smoothness * 0.8) reasons.push("Smoothness");
+    if (basis.stability && rep.gyroStabilityScore < basis.stability * (mode === "weight_stack" ? 0.65 : 0.7)) reasons.push("Stabilität");
+    if (sensorQuality.status !== "good") reasons.push("Messung unsicher");
+
+    if (sensorQuality.status !== "good" && reasons.length <= 1) rep.qualityClass = "uncertain";
+    else if (reasons.length >= 3) rep.qualityClass = "bad";
+    else if (reasons.length >= 1) rep.qualityClass = "warning";
+    else rep.qualityClass = "clean";
+    rep.qualityReasons = reasons;
+    counts[rep.qualityClass] += 1;
+    if ((rep.qualityClass === "bad" || rep.qualityClass === "uncertain") && firstBadRep === null) firstBadRep = rep.repNumber;
+    reasons.forEach((reason) => issueCounts.set(reason, (issueCounts.get(reason) || 0) + 1));
+  });
+  const mainIssue = [...issueCounts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] || "—";
+  const velocityLossPercent = Math.max(0, ...repMetrics.map((rep) => rep.velocityLossPercent || 0));
+  return { ...counts, firstBadRep, mainIssue, velocityLossPercent };
 }
 
 function detectFatigue(repMetrics, referenceRepMetrics = []) {
@@ -1537,6 +1544,7 @@ function detectFatigue(repMetrics, referenceRepMetrics = []) {
     tremorScore: average(pool.map((rep) => rep.tremorScore).filter(Number.isFinite)),
     smoothnessScore: average(pool.map((rep) => rep.smoothnessScore).filter(Number.isFinite)),
     gyroStabilityScore: average(pool.map((rep) => rep.gyroStabilityScore).filter(Number.isFinite)),
+    velocityProxy: average(pool.map((rep) => rep.velocityProxy).filter(Number.isFinite)),
   };
   for (const rep of repMetrics) {
     const reasons = [];
@@ -1545,6 +1553,7 @@ function detectFatigue(repMetrics, referenceRepMetrics = []) {
     if (baseline.tremorScore && rep.tremorScore > baseline.tremorScore * 1.3) reasons.push("Tremor/Ruckeln steigt");
     if (baseline.smoothnessScore && rep.smoothnessScore < baseline.smoothnessScore * 0.8) reasons.push("Smoothness sinkt");
     if (baseline.gyroStabilityScore && rep.gyroStabilityScore < baseline.gyroStabilityScore * 0.7) reasons.push("Gyro-Stabilität verschlechtert sich");
+    if (baseline.velocityProxy && rep.velocityProxy < baseline.velocityProxy * 0.8) reasons.push("VelocityProxy sinkt");
     if (reasons.length >= 2) {
       return {
         fatigueDetected: true,
@@ -1605,6 +1614,8 @@ function compareToReferenceByMode(currentRecording, referenceRecording, exercise
   };
   comparison.feedbackMessages = buildFeedbackMessages(currentMetrics, comparison, exercise);
   if (tooLittleData) comparison.feedbackMessages.unshift("Datenmenge zu gering für eine belastbare Analyse.");
+  currentMetrics.recommendation = generateTrainingRecommendation(currentMetrics, comparison, exercise);
+  comparison.feedbackEvents = buildFeedbackEvents(currentMetrics, comparison);
   return comparison;
 }
 
@@ -1614,6 +1625,7 @@ function buildFeedbackMessages(analysis, comparison, exercise = getSelectedExerc
   if (comparison.overallScore >= 82) messages.push("Bewegung sehr ähnlich zur Referenz.");
   else if (comparison.overallScore >= 65) messages.push("Ausführung insgesamt nah an der Referenz.");
   else messages.push("Ausführung weicht deutlich von der Referenz ab.");
+  if (analysis.sensorQuality?.status !== "good") messages.push(`Messung unsicher: ${analysis.sensorQuality.issues.join(", ")}`);
   if (comparison.avgRepDurationDiffPercent < -15) messages.push("Tempo deutlich schneller als Referenz.");
   if (comparison.avgRepDurationDiffPercent > 18) messages.push("Tempo deutlich langsamer als Referenz.");
   if (comparison.amplitudeDiffPercent < -15) messages.push("Range of Motion wirkt verkürzt im Vergleich zur Referenz.");
@@ -1628,7 +1640,72 @@ function buildFeedbackMessages(analysis, comparison, exercise = getSelectedExerc
   return [...new Set(messages)];
 }
 
-function buildMetricEvents(repMetrics, fatigue, mode) {
+function generateTrainingRecommendation(analysis, comparison = null, exercise = getSelectedExercise()) {
+  const total = Math.max(analysis.reps || 0, 1);
+  const cleanRatio = (analysis.cleanRepCount || 0) / total;
+  const badRatio = ((analysis.badRepCount || 0) + (analysis.uncertainRepCount || 0)) / total;
+  const velocityLoss = analysis.velocityLossPercent || 0;
+  const rom = comparison?.relativeRangeOfMotion ?? analysis.relativeRangeOfMotion;
+  const hasEarlyFatigue = analysis.fatigue?.fatigueDetected && analysis.fatigue.fatigueStartRep <= Math.max(3, Math.ceil(total * 0.5));
+  const sensorUncertain = analysis.sensorQuality?.status !== "good";
+  const reasons = [];
+
+  if (sensorUncertain) {
+    reasons.push("Messung unsicher");
+    return {
+      action: "technique_focus",
+      label: "Technikfokus",
+      message: "Technikfokus: Sensor/Signal zuerst stabilisieren, dann Satz erneut bewerten.",
+      reasons,
+    };
+  }
+
+  if (cleanRatio >= 0.9 && !analysis.fatigue?.fatigueDetected && velocityLoss < 15 && (!rom || rom >= 92)) {
+    reasons.push("fast alle Reps sauber", "kaum Ermüdung", "ROM stabil");
+    return {
+      action: "increase_weight",
+      label: "Gewicht erhöhen",
+      message: `Gewicht erhöhen: nächster Satz ${exercise?.targetReps || "Ziel"} Reps mit kleiner Steigerung möglich.`,
+      reasons,
+    };
+  }
+
+  if (hasEarlyFatigue || badRatio >= 0.35 || velocityLoss > 35 || (rom && rom < 85)) {
+    if (hasEarlyFatigue) reasons.push(`frühe Ermüdung ab Rep ${analysis.fatigue.fatigueStartRep}`);
+    if (badRatio >= 0.35) reasons.push("viele schlechte/unsichere Reps");
+    if (velocityLoss > 35) reasons.push("hoher Tempoverlust");
+    if (rom && rom < 85) reasons.push("ROM deutlich reduziert");
+    return {
+      action: "reduce_weight",
+      label: "Gewicht reduzieren",
+      message: "Gewicht reduzieren: Bewegung zuerst stabil und mit voller ROM ausführen.",
+      reasons,
+    };
+  }
+
+  if ((analysis.warningRepCount || 0) > 0 || analysis.fatigue?.fatigueDetected || velocityLoss >= 18) {
+    if (analysis.fatigue?.fatigueDetected) reasons.push(`Ermüdung ab Rep ${analysis.fatigue.fatigueStartRep}`);
+    if (velocityLoss >= 18) reasons.push("moderater Tempoverlust");
+    if (analysis.mainIssue && analysis.mainIssue !== "—") reasons.push(`Hauptthema: ${analysis.mainIssue}`);
+    return {
+      action: "hold_weight",
+      label: "Gewicht halten",
+      message: `Gewicht halten: nächster Satz ${exercise?.targetReps ? `${exercise.targetReps} Reps` : "im Zielbereich"}, Fokus ${analysis.mainIssue && analysis.mainIssue !== "—" ? analysis.mainIssue : "saubere Ausführung"}.`,
+      reasons,
+    };
+  }
+
+  return {
+    action: "hold_weight",
+    label: "Gewicht halten",
+    message: "Gewicht halten: Satz größtenteils sauber, Qualität weiter bestätigen.",
+    reasons: ["Satz größtenteils sauber"],
+  };
+}
+
+function buildFeedbackEvents(analysis, comparison = null) {
+  const repMetrics = analysis.repMetrics || [];
+  const fatigue = analysis.fatigue || {};
   const events = [];
   if (fatigue.fatigueDetected) events.push({ type: "fatigue_start", rep: fatigue.fatigueStartRep });
   const firstGroup = repMetrics.slice(0, Math.min(3, repMetrics.length));
@@ -1636,10 +1713,17 @@ function buildMetricEvents(repMetrics, fatigue, mode) {
   const baselineAmplitude = average(firstGroup.map((rep) => rep.amplitudeProxy));
   repMetrics.forEach((rep) => {
     if (baselineAmplitude && rep.amplitudeProxy < baselineAmplitude * 0.85) events.push({ type: "rom_low", rep: rep.repNumber });
+    if (rep.velocityLossPercent > 20) events.push({ type: "tempo_fast", rep: rep.repNumber });
     if (baselineTremor && rep.tremorScore > baselineTremor * 1.3) events.push({ type: "tremor_high", rep: rep.repNumber });
-    if (mode === "barbell" && rep.maxTiltProxy > 45) events.push({ type: "bar_tilt", rep: rep.repNumber });
+    if (rep.maxTiltProxy > 45) events.push({ type: "bar_tilt", rep: rep.repNumber });
   });
+  if (analysis.sensorQuality?.status !== "good") events.push({ type: "sensor_unstable", rep: null });
+  if (comparison?.relativeRangeOfMotion && comparison.relativeRangeOfMotion < 85) events.push({ type: "rom_low", rep: null });
   return events;
+}
+
+function buildMetricEvents(repMetrics, fatigue, mode) {
+  return buildFeedbackEvents({ repMetrics, fatigue, analysisMode: mode }, null);
 }
 
 function normalizedCurveRmseValues(currentValues, referenceValues) {
@@ -1685,6 +1769,13 @@ function average(values) {
   return valid.length ? valid.reduce((sum, value) => sum + value, 0) / valid.length : 0;
 }
 
+function standardDeviation(values) {
+  const valid = values.filter(Number.isFinite);
+  if (!valid.length) return 0;
+  const mean = average(valid);
+  return Math.sqrt(average(valid.map((value) => (value - mean) ** 2)));
+}
+
 function resampleProperty(data, property, targetLength) {
   return resampleValues(data.map((sample) => Number(sample[property]) || 0), targetLength);
 }
@@ -1711,6 +1802,8 @@ function openExerciseForm(exercise = null) {
   elements.equipmentType.value = exercise?.equipmentType || "Geführte Maschine";
   elements.muscleGroup.value = exercise?.muscleGroup || "";
   elements.exerciseWeight.value = exercise?.weight || "";
+  elements.targetReps.value = exercise?.targetReps || "";
+  elements.setType.value = normalizeSetType(exercise?.setType);
   elements.sensorPosition.value = exercise?.sensorPosition || "";
   elements.analysisMode.value = normalizeAnalysisMode(exercise?.analysisMode, exercise?.equipmentType);
   elements.exerciseNotes.value = exercise?.notes || "";
@@ -1737,6 +1830,8 @@ function handleExerciseSubmit(event) {
     equipmentType: elements.equipmentType.value.trim(),
     muscleGroup: elements.muscleGroup.value.trim(),
     weight: elements.exerciseWeight.value.trim(),
+    targetReps: Number(elements.targetReps.value) || "",
+    setType: normalizeSetType(elements.setType.value),
     sensorPosition: elements.sensorPosition.value.trim(),
     analysisMode: normalizeAnalysisMode(elements.analysisMode.value),
     notes: elements.exerciseNotes.value.trim(),
@@ -1779,6 +1874,27 @@ function reanalyzeExerciseRecordings(exercise) {
       setRecording.comparison = compareRecordingToReference(setRecording, exercise.referenceRecording, exercise);
       setRecording.metrics.movementQualityScore = setRecording.comparison.overallScore;
     }
+  });
+}
+
+function addSetToSession(exercise, recordingData) {
+  if (!Array.isArray(appState.sessions)) appState.sessions = [];
+  const dateKey = new Date(recordingData.createdAt).toISOString().slice(0, 10);
+  let session = appState.sessions.find((item) => item.date.slice(0, 10) === dateKey);
+  if (!session) {
+    session = { id: createId(), date: new Date(recordingData.createdAt).toISOString(), sets: [] };
+    appState.sessions.push(session);
+  }
+  session.sets.push({
+    recordingId: recordingData.id,
+    exerciseId: exercise.id,
+    exerciseName: exercise.name,
+    weight: exercise.weight,
+    reps: recordingData.metrics.reps,
+    cleanReps: recordingData.metrics.cleanRepCount,
+    qualityScore: recordingData.comparison?.overallScore ?? recordingData.metrics.movementQualityScore,
+    recommendation: recordingData.metrics.recommendation?.action || "hold_weight",
+    createdAt: recordingData.createdAt,
   });
 }
 
@@ -1900,7 +2016,7 @@ async function importAllData(file) {
 function deleteAllData() {
   if (!window.confirm("Wirklich alle Übungen, Referenzen und Sätze in diesem Browser löschen?")) return;
   localStorage.removeItem(STORAGE_KEY);
-  appState = { version: 1, selectedExerciseId: null, exercises: [] };
+  appState = { version: 1, selectedExerciseId: null, sessions: [], exercises: [] };
   selectedExportExerciseId = null;
   selectedAnalysisRecordingIds.clear();
   discardRecording();
@@ -2056,6 +2172,8 @@ function renderExercises() {
             ${chip(exercise.equipmentType)}
             ${chip(exercise.muscleGroup)}
             ${chip(exercise.weight)}
+            ${chip(exercise.targetReps ? `${exercise.targetReps} Ziel-Reps` : "")}
+            ${chip(setTypeLabel(exercise.setType))}
             ${chip(exercise.sensorPosition)}
             ${chip(analysisModeLabel(exercise.analysisMode))}
             ${exercise.calibrationProfile ? chip("Kalibriert") : ""}
@@ -2109,8 +2227,9 @@ function renderRecordingState() {
     recordingMode === "reference" ? "Referenz" :
       recordingMode === "set" ? "Trainingssatz" : "—";
   elements.analysisModeValue.textContent = exercise ? analysisModeLabel(exercise.analysisMode) : "—";
-  elements.sampleCount.textContent = String(samples.length);
+  elements.sampleCount.textContent = liveAnalysis.dominantAxis || "—";
   elements.liveRepCount.textContent = String(liveAnalysis.reps || 0);
+  updateLiveTrainingValues(liveAnalysis);
 
   if (recording) {
     elements.recordingBadge.textContent = recordingMode === "reference"
@@ -2129,6 +2248,7 @@ function renderRecordingState() {
 function renderRecordingPreview() {
   if (!pendingRecording) {
     elements.recordingPreview.hidden = true;
+    elements.subjectiveSetPanel.hidden = true;
     return;
   }
   const metrics = pendingRecording.metrics;
@@ -2139,14 +2259,16 @@ function renderRecordingPreview() {
       : "Noch keine Referenz vorhanden.",
   ];
   elements.recordingPreview.hidden = false;
+  elements.subjectiveSetPanel.hidden = pendingRecording.type !== "set";
   elements.recordingPreview.innerHTML = `
     <div class="section-heading">
       <div>
         <p class="eyebrow">Aufnahme abgeschlossen</p>
-        <h2>${escapeHtml(pendingRecording.name)}</h2>
+        <h2>${escapeHtml(getSelectedExercise()?.name || pendingRecording.name)}${getSelectedExercise()?.weight ? ` – ${escapeHtml(getSelectedExercise().weight)}` : ""}</h2>
       </div>
       <span class="score ${scoreClass(score)}">${Math.round(score)} %</span>
     </div>
+    ${renderAthleteSummary(metrics, pendingRecording.comparison, getSelectedExercise())}
     <div class="result-grid">
       ${metricResult("Reps", metrics.reps)}
       ${metricResult("Dauer", formatDuration(pendingRecording.durationMs))}
@@ -2157,6 +2279,9 @@ function renderRecordingPreview() {
       ${metricResult("Tremor", formatNumber(metrics.tremorScore, 2))}
       ${metricResult("Stabilität", `${metrics.stabilityScore} %`)}
       ${metricResult("Fatigue", metrics.fatigue?.fatigueDetected ? `ab Rep ${metrics.fatigue.fatigueStartRep}` : "Nein")}
+      ${metricResult("Grenzwertig", metrics.warningRepCount || 0)}
+      ${metricResult("Schlecht/unsicher", (metrics.badRepCount || 0) + (metrics.uncertainRepCount || 0))}
+      ${metricResult("Hauptgrund", metrics.mainIssue || "—")}
       ${metricResult("Achse", metrics.dominantAxis)}
     </div>
     <ul>${feedback.map((message) => `<li>${escapeHtml(message)}</li>`).join("")}</ul>
@@ -2237,6 +2362,7 @@ function renderAnalysis() {
                 <button type="button" class="danger" data-action="delete-set" data-exercise-id="${exercise.id}" data-id="${recordingData.id}">Löschen</button>
               </div>
             </div>
+            ${renderAthleteSummary(recordingData.metrics, recordingData.comparison, exercise)}
             <ul>${messages.map((message) => `<li>${escapeHtml(message)}</li>`).join("")}</ul>
           </article>
         `;
@@ -2290,10 +2416,57 @@ function metricResult(label, value) {
   return `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(String(value))}</strong></div>`;
 }
 
+function renderAthleteSummary(metrics = emptyMetrics(), comparison = null, exercise = getSelectedExercise()) {
+  const recommendation = metrics.recommendation || generateTrainingRecommendation(metrics, comparison, exercise);
+  const fatigueText = metrics.fatigue?.fatigueDetected ? `ab Rep ${metrics.fatigue.fatigueStartRep}` : "nicht deutlich";
+  const romText = formatRomMetric(metrics, comparison);
+  const cleanText = `${metrics.cleanRepCount || 0}/${metrics.reps || 0}`;
+  return `
+    <div class="athlete-summary">
+      <div>
+        <span>Reps erkannt</span>
+        <strong>${metrics.reps || 0}</strong>
+      </div>
+      <div>
+        <span>Saubere Reps</span>
+        <strong>${cleanText}</strong>
+      </div>
+      <div>
+        <span>Ermüdung</span>
+        <strong>${escapeHtml(fatigueText)}</strong>
+      </div>
+      <div>
+        <span>ROM</span>
+        <strong>${escapeHtml(romText)}</strong>
+      </div>
+      <div>
+        <span>Tempoverlust</span>
+        <strong>${Math.round(metrics.velocityLossPercent || 0)} %</strong>
+      </div>
+      <div>
+        <span>Ruckeln</span>
+        <strong>${escapeHtml(tremorLabel(metrics.tremorScore))}</strong>
+      </div>
+    </div>
+    <article class="recommendation-card">
+      <span>Empfehlung</span>
+      <strong>${escapeHtml(recommendation.label)}</strong>
+      <p>${escapeHtml(recommendation.message)}</p>
+    </article>
+  `;
+}
+
 function formatRomMetric(metrics, comparison = null) {
   const relative = comparison?.relativeRangeOfMotion ?? metrics?.relativeRangeOfMotion;
   if (Number.isFinite(Number(relative))) return `${Math.round(relative)} %`;
   return formatNumber(metrics?.ROMProxy ?? metrics?.amplitudeEstimate, 3);
+}
+
+function tremorLabel(score) {
+  if (!Number.isFinite(Number(score))) return "—";
+  if (score > 2.2) return "hoch";
+  if (score > 1.1) return "erhöht";
+  return "niedrig";
 }
 
 function chip(value) {
@@ -2308,6 +2481,16 @@ function analysisModeLabel(mode) {
     free_movement: "Freie Bewegung",
     body_segment: "Körpersegment (Future)",
   }[normalizeAnalysisMode(mode)] || "Freie Bewegung";
+}
+
+function setTypeLabel(type) {
+  return {
+    technique: "Technik",
+    hypertrophy: "Hypertrophie",
+    strength: "Kraft",
+    explosive: "Explosiv",
+    warmup: "Warm-up",
+  }[normalizeSetType(type)] || "Hypertrophie";
 }
 
 function scoreClass(score) {
@@ -2338,13 +2521,21 @@ function updateCurrentValues(sample) {
   ["ax", "ay", "az", "gx", "gy", "gz"].forEach((key) => {
     elements.values[key].textContent = formatNumber(sample[key], 3);
   });
-  elements.values.accMagnitude.textContent = formatNumber(sample.accMagnitude, 3);
-  elements.values.gyroMagnitude.textContent = formatNumber(sample.gyroMagnitude, 3);
+  if (!recording) {
+    elements.values.accMagnitude.textContent = "—";
+    elements.values.gyroMagnitude.textContent = "—";
+  }
+}
+
+function updateLiveTrainingValues(metrics = liveAnalysis) {
+  elements.sampleCount.textContent = metrics.dominantAxis || "—";
+  elements.values.accMagnitude.textContent = metrics.reps ? `${Math.round(metrics.stabilityScore)} %` : "—";
+  elements.values.gyroMagnitude.textContent = metrics.reps ? tremorLabel(metrics.tremorScore) : "—";
 }
 
 function resetLiveDisplay() {
   elements.recordingTime.textContent = "00:00.0";
-  elements.sampleCount.textContent = "0";
+  elements.sampleCount.textContent = "—";
   elements.liveRepCount.textContent = "0";
   elements.sampleTimestamp.textContent = "t = — ms";
   Object.values(elements.values).forEach((element) => {

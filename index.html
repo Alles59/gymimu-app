@@ -95,6 +95,20 @@
                 <input id="exerciseWeight" name="weight" placeholder="z. B. 50 kg">
               </label>
               <label>
+                Ziel-Reps
+                <input id="targetReps" name="targetReps" type="number" min="1" max="50" step="1" placeholder="z. B. 10">
+              </label>
+              <label>
+                Satztyp
+                <select id="setType" name="setType">
+                  <option value="hypertrophy">Hypertrophie</option>
+                  <option value="strength">Kraft</option>
+                  <option value="technique">Technik</option>
+                  <option value="explosive">Explosiv</option>
+                  <option value="warmup">Warm-up</option>
+                </select>
+              </label>
+              <label>
                 Sensorposition
                 <input id="sensorPosition" name="sensorPosition" placeholder="z. B. Gewichtsblock">
               </label>
@@ -181,7 +195,7 @@
               <strong id="recordingTime">00:00.0</strong>
             </article>
             <article class="metric-card">
-              <span>Samples</span>
+              <span>Primärachse</span>
               <strong id="sampleCount">0</strong>
             </article>
             <article class="metric-card highlight">
@@ -189,16 +203,17 @@
               <strong id="liveRepCount">0</strong>
             </article>
             <article class="metric-card">
-              <span>accMagnitude</span>
+              <span>Stabilität</span>
               <strong id="accMagnitudeValue">—</strong>
             </article>
             <article class="metric-card">
-              <span>gyroMagnitude</span>
+              <span>Ruckeln</span>
               <strong id="gyroMagnitudeValue">—</strong>
             </article>
           </section>
 
-          <article class="panel live-values">
+          <details class="panel live-values details-panel">
+            <summary>Sensor-Rohdaten / Debug</summary>
             <div class="section-heading">
               <div>
                 <p class="eyebrow">Sensor</p>
@@ -214,7 +229,7 @@
               <span>gy <strong id="gyValue">—</strong></span>
               <span>gz <strong id="gzValue">—</strong></span>
             </div>
-          </article>
+          </details>
 
           <div class="chart-grid">
             <article class="panel chart-card">
@@ -240,6 +255,29 @@
           </div>
 
           <article id="recordingPreview" class="panel result-panel" hidden></article>
+
+          <article id="subjectiveSetPanel" class="panel form-panel" hidden>
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">Subjektiv</p>
+                <h2>Satzgefühl ergänzen</h2>
+              </div>
+            </div>
+            <div class="form-grid">
+              <label>
+                RPE
+                <input id="setRpe" type="number" min="1" max="10" step="0.5" placeholder="1-10">
+              </label>
+              <label>
+                RIR
+                <input id="setRir" type="number" min="0" max="10" step="1" placeholder="Reps im Tank">
+              </label>
+              <label class="form-wide">
+                Satznotiz
+                <textarea id="setNote" rows="2" placeholder="z. B. letzter Rep langsam, Setup gut"></textarea>
+              </label>
+            </div>
+          </article>
         </section>
 
         <section id="tab-analysis" class="tab-panel" data-panel="analysis">
@@ -286,6 +324,11 @@
                 </div>
                 <canvas id="gyroOverlayChart" aria-label="Gyroskop-Overlay"></canvas>
               </article>
+            </div>
+
+            <details class="details-panel metric-details">
+              <summary>Pro-Rep-Details und Zusatzcharts</summary>
+              <div class="chart-grid detail-chart-grid">
               <article class="panel chart-card">
                 <div class="chart-title">
                   <h2 id="metricChartOneTitle">Amplitude / ROM</h2>
@@ -314,7 +357,8 @@
                 </div>
                 <canvas id="metricChartFour" aria-label="Stabilität pro Wiederholung"></canvas>
               </article>
-            </div>
+              </div>
+            </details>
 
             <article class="panel table-panel">
               <div class="section-heading">
