@@ -644,7 +644,8 @@ canvas {
   margin-top: 1rem;
 }
 
-.future-toggle {
+.future-toggle,
+.audio-toggle {
   min-height: 46px;
   border: 1px dashed var(--border);
   border-radius: 10px;
@@ -653,11 +654,61 @@ canvas {
   color: var(--muted);
 }
 
+.audio-toggle {
+  border-style: solid;
+  border-color: rgba(82, 224, 160, 0.35);
+  color: var(--text);
+}
+
 .toggle-label input,
 .checkbox-item input {
   width: auto;
   min-height: 0;
   margin: 0;
+}
+
+.rep-feedback-list {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.55rem;
+  margin-top: 1rem;
+}
+
+.rep-pill {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 0.7rem;
+  background: var(--panel-2);
+}
+
+.rep-pill strong,
+.rep-pill span,
+.rep-pill small {
+  display: block;
+}
+
+.rep-pill span {
+  margin-top: 0.18rem;
+  font-weight: 800;
+}
+
+.rep-pill small {
+  margin-top: 0.25rem;
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+
+.rep-clean {
+  border-color: rgba(82, 224, 160, 0.42);
+}
+
+.rep-warning {
+  border-color: rgba(255, 200, 87, 0.5);
+}
+
+.rep-bad,
+.rep-uncertain {
+  border-color: rgba(255, 104, 120, 0.52);
 }
 
 .checkbox-item {
@@ -783,7 +834,8 @@ footer {
 
   .form-grid,
   .recording-actions,
-  .chart-grid {
+  .chart-grid,
+  .rep-feedback-list {
     grid-template-columns: 1fr;
   }
 

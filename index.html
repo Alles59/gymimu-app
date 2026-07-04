@@ -163,9 +163,9 @@
               <button id="connectButton" type="button" class="primary">Connect BLE</button>
               <button id="demoButton" type="button">Demo-Modus starten</button>
               <button id="calibrateButton" type="button">Sensor kalibrieren</button>
-              <label class="toggle-label future-toggle">
-                <input id="audioFeedbackToggle" type="checkbox" disabled>
-                Audiofeedback später aktivieren
+              <label class="toggle-label audio-toggle">
+                <input id="audioFeedbackToggle" type="checkbox">
+                Audiofeedback aktiv
               </label>
             </div>
           </article>
@@ -203,7 +203,7 @@
               <strong id="liveRepCount">0</strong>
             </article>
             <article class="metric-card">
-              <span>Stabilität</span>
+              <span>Rep-Qualität</span>
               <strong id="accMagnitudeValue">—</strong>
             </article>
             <article class="metric-card">
@@ -228,6 +228,7 @@
               <span>gx <strong id="gxValue">—</strong></span>
               <span>gy <strong id="gyValue">—</strong></span>
               <span>gz <strong id="gzValue">—</strong></span>
+              <span>Samples <strong id="debugSampleCount">0</strong></span>
             </div>
           </details>
 
@@ -239,10 +240,10 @@
               </div>
               <canvas id="accChart" aria-label="Live-Beschleunigungsdiagramm"></canvas>
             </article>
-            <article class="panel chart-card">
+            <article id="liveSecondaryChartCard" class="panel chart-card">
               <div class="chart-title">
-                <h2 id="liveSecondaryChartTitle">Gyro / Stabilität</h2>
-                <span>Live-Verlauf je nach Analysemodus</span>
+                <h2 id="liveSecondaryChartTitle">Gyro / Debug</h2>
+                <span>Nur Debug/Sensorcheck</span>
               </div>
               <canvas id="gyroChart" aria-label="Live-Gyroskopdiagramm"></canvas>
             </article>
@@ -317,10 +318,10 @@
                 </div>
                 <canvas id="accOverlayChart" aria-label="Beschleunigungs-Overlay"></canvas>
               </article>
-              <article class="panel chart-card">
+              <article id="overlaySecondaryChartCard" class="panel chart-card">
                 <div class="chart-title">
-                  <h2 id="overlaySecondaryTitle">Stabilität / Rotation</h2>
-                  <span>Zeitlich normalisiert</span>
+                  <h2 id="overlaySecondaryTitle">Gyro / Debug</h2>
+                  <span>Nur Sensorcheck, nicht Score-relevant</span>
                 </div>
                 <canvas id="gyroOverlayChart" aria-label="Gyroskop-Overlay"></canvas>
               </article>

@@ -13,6 +13,69 @@ const OVERLAY_POINT_COUNT = 240;
 const MIN_ANALYSIS_SAMPLES = 20;
 const CHART_COLORS = ["#52e0a0", "#62a4ff", "#ffc857", "#b18cff", "#ff7f91", "#55d8e8"];
 
+const defaultWeightStackOptions = {
+  accUnit: "g",
+  restMs: 1200,
+  minRepMs: 700,
+  maxRepMs: 8000,
+  minPhaseMs: 250,
+  refractoryMs: 250,
+  enableRestCalibration: true,
+  enableAutoAxisDetection: true,
+  enable3DProjection: true,
+  enableLowPassFilter: true,
+  enableVelocityIntegration: true,
+  enablePositionProxy: true,
+  enableStateMachine: true,
+  enableAdaptiveThresholds: true,
+  enableRomBaseline: true,
+  enablePartialRepDetection: true,
+  enableTempoFlags: true,
+  enableDroppedWeightDetection: true,
+  enableJerkDetection: true,
+  enableVelocityLoss: true,
+  enableGyroAssist: false,
+  enableAutocorrelationHint: false,
+  enableTemplateMatching: false,
+  enableExerciseProfiles: true,
+  enableDebug: true,
+  debugKeepArrays: true,
+  cutoffHz: 6,
+  leak: 0.995,
+  minActivityG: 0.04,
+  startVelocityThreshold: null,
+  minAmplitude: null,
+  partialRepRomRatio: 0.75,
+  controlledDownMinMs: 600,
+  droppedWeightSpikeG: 1.2,
+  jerkThreshold: null,
+};
+
+const WEIGHT_STACK_EXERCISE_PROFILES = {
+  default: {
+    minRepMs: 700,
+    maxRepMs: 8000,
+    minPhaseMs: 250,
+    controlledDownMinMs: 600,
+    partialRepRomRatio: 0.75,
+  },
+  lat_pulldown: {
+    minRepMs: 900,
+    maxRepMs: 9000,
+    controlledDownMinMs: 700,
+  },
+  leg_extension: {
+    minRepMs: 700,
+    maxRepMs: 7000,
+    controlledDownMinMs: 600,
+  },
+};
+
+let lastWeightStackRepDebug = {
+  mode: "not_run",
+  warning: "Weight-stack detector has not run yet.",
+};
+
 const elements = {
   message: document.querySelector("#message"),
   connectionStatus: document.querySelector("#connectionStatus"),
@@ -46,6 +109,7 @@ const elements = {
   demoButton: document.querySelector("#demoButton"),
   calibrateButton: document.querySelector("#calibrateButton"),
   audioFeedbackToggle: document.querySelector("#audioFeedbackToggle"),
+  debugSampleCount: document.querySelector("#debugSampleCount"),
   startReferenceButton: document.querySelector("#startReferenceButton"),
   startSetButton: document.querySelector("#startSetButton"),
   stopButton: document.querySelector("#stopButton"),
@@ -81,6 +145,8 @@ const elements = {
   gyroChart: document.querySelector("#gyroChart"),
   accOverlayChart: document.querySelector("#accOverlayChart"),
   gyroOverlayChart: document.querySelector("#gyroOverlayChart"),
+  liveSecondaryChartCard: document.querySelector("#liveSecondaryChartCard"),
+  overlaySecondaryChartCard: document.querySelector("#overlaySecondaryChartCard"),
   livePrimaryChartTitle: document.querySelector("#livePrimaryChartTitle"),
   liveSecondaryChartTitle: document.querySelector("#liveSecondaryChartTitle"),
   overlayPrimaryTitle: document.querySelector("#overlayPrimaryTitle"),
@@ -127,12 +193,21 @@ let liveAnalysis = emptyMetrics();
 
 let demoIntervalId = null;
 let demoStartedAt = 0;
+let demoRecordingStartedAt = 0;
 let demoLastTickAt = 0;
 let demoPhase = 0;
 let messageTimeoutId = null;
 let calibrationActive = false;
 let calibrationSamples = [];
 let calibrationTimerId = null;
+let audioFeedbackEnabled = false;
+let audioQueue = [];
+let audioProcessing = false;
+let lastAudioAt = 0;
+let audioEventCounts = {};
+let lastAudioRepCount = 0;
+let cleanRepOptionalSpoken = false;
+let audioCooldownMs = 2500;
 
 // ---------------------------------------------------------------------------
 // Storage und Datenmodell
@@ -508,6 +583,9 @@ function generateDemoSample() {
   const now = performance.now();
   const elapsedMs = now - demoStartedAt;
   const elapsedSeconds = elapsedMs / 1000;
+  const recordingElapsedSeconds = recording && demoRecordingStartedAt
+    ? (now - demoRecordingStartedAt) / 1000
+    : elapsedSeconds;
   const deltaSeconds = Math.max(0.001, (now - demoLastTickAt) / 1000);
   demoLastTickAt = now;
   const profile = elements.demoProfile.value;
@@ -521,7 +599,7 @@ function generateDemoSample() {
   if (profile === "short") amplitude = 0.34;
   if (profile === "jerky") noiseLevel = 0.065;
   if (profile === "fatigue") {
-    const fatigue = clamp(elapsedSeconds / 35, 0, 1);
+    const fatigue = clamp(recordingElapsedSeconds / 18, 0, 1);
     period = 1.8 + fatigue * 0.55;
     amplitude = 0.68 * (1 - fatigue * 0.48);
     noiseLevel = 0.018 + fatigue * 0.055;
@@ -529,9 +607,14 @@ function generateDemoSample() {
 
   demoPhase = (demoPhase + deltaSeconds / period) % 1;
   const phase = demoPhase;
-  const smoothPulse = Math.sin(Math.PI * phase) ** 2;
-  const velocity = Math.sin(2 * Math.PI * phase);
-  const direction = Math.cos(2 * Math.PI * phase);
+  const targetReps = 8;
+  const demoSetFinished = recording && recordingElapsedSeconds > period * targetReps + 0.75;
+  const activeFraction = 0.6;
+  const activePhase = phase / activeFraction;
+  const inRestDwell = phase >= activeFraction;
+  const smoothPulse = demoSetFinished || inRestDwell ? 0 : Math.sin(Math.PI * activePhase) ** 2;
+  const velocity = demoSetFinished || inRestDwell ? 0 : Math.sin(2 * Math.PI * activePhase);
+  const direction = demoSetFinished || inRestDwell ? 0 : Math.cos(2 * Math.PI * activePhase);
   const gaussian = (center, width) => Math.exp(-((phase - center) ** 2) / width);
   const jerk = profile === "jerky"
     ? 0.38 * gaussian(0.22, 0.0009) - 0.28 * gaussian(0.68, 0.0014)
@@ -604,11 +687,13 @@ function processDataLine(line, source) {
 
   samples.push(sample);
   elements.sampleCount.textContent = String(samples.length);
+  if (elements.debugSampleCount) elements.debugSampleCount.textContent = String(samples.length);
 
   if (samples.length % 8 === 0 || samples.length < 10) {
     liveAnalysis = analyzeRecordingByMode(samples, getSelectedExercise());
     elements.liveRepCount.textContent = String(liveAnalysis.reps);
     updateLiveTrainingValues(liveAnalysis);
+    queueLiveRepAudio(liveAnalysis);
   }
   if (samples.length % 3 === 0 || samples.length < 5) {
     drawCharts();
@@ -638,8 +723,15 @@ async function startRecording(mode = "set") {
     recording = true;
     recordingMode = mode === "reference" ? "reference" : "set";
     recordingStartedAt = Date.now();
+    if (isDemoActive()) {
+      demoRecordingStartedAt = performance.now();
+      demoPhase = 0;
+    }
     recordedDurationMs = 0;
     liveAnalysis = emptyMetrics();
+    lastAudioRepCount = 0;
+    cleanRepOptionalSpoken = false;
+    audioEventCounts = {};
     recordingTimerId = window.setInterval(updateRecordingTime, 100);
     elements.recordingPreview.hidden = true;
     elements.subjectiveSetPanel.hidden = true;
@@ -658,6 +750,7 @@ async function stopRecording(sendCommand = true) {
 
   recordedDurationMs = Date.now() - recordingStartedAt;
   recording = false;
+  demoRecordingStartedAt = 0;
   window.clearInterval(recordingTimerId);
   recordingTimerId = null;
 
@@ -694,6 +787,13 @@ async function stopRecording(sendCommand = true) {
     );
     pendingRecording.metrics.movementQualityScore = pendingRecording.comparison.overallScore;
   }
+  if (type === "set") {
+    queueAudioCue({
+      type: "set_summary",
+      message: buildSetSummaryAudio(pendingRecording.metrics),
+      priority: 10,
+    });
+  }
 
   renderRecordingState();
   renderRecordingPreview();
@@ -708,6 +808,7 @@ function discardRecording() {
   samples = [];
   pendingRecording = null;
   recordingMode = null;
+  demoRecordingStartedAt = 0;
   recordedDurationMs = 0;
   liveAnalysis = emptyMetrics();
   resetLiveDisplay();
@@ -853,6 +954,14 @@ function saveReference() {
   pendingRecording.name = "Referenz";
   pendingRecording.metrics = analyzeRecordingByMode(pendingRecording.rawSamples, exercise);
   pendingRecording.metrics.referenceQuality = assessReferenceQuality(pendingRecording.metrics);
+  if (pendingRecording.metrics.referenceQuality.status !== "good") {
+    const issues = pendingRecording.metrics.referenceQuality.issues.join(", ");
+    speakFeedback("Referenz ungeeignet, bitte neu aufnehmen.");
+    if (!window.confirm(`Referenz ungeeignet: ${issues}. Trotzdem als Referenz speichern?`)) {
+      showMessage(`Referenz ungeeignet. Bitte neu aufnehmen: ${issues}`, "error", true);
+      return;
+    }
+  }
   pendingRecording.metrics.movementQualityScore = Math.round(
     (pendingRecording.metrics.smoothnessScore + pendingRecording.metrics.tempoConsistencyScore) / 2,
   );
@@ -873,6 +982,7 @@ function saveReference() {
   pendingRecording = null;
   recordingMode = null;
   showMessage("Referenz für diese Übung gespeichert.", "success");
+  speakFeedback("Referenz gespeichert.");
   renderAll();
 }
 
@@ -905,6 +1015,30 @@ function copySample(sample) {
   };
 }
 
+function normalizeWeightStackInputSamples(inputSamples) {
+  return inputSamples.map((sample, index) => {
+    const accel = extractAccelSample(sample);
+    if (!accel) return null;
+    const timestamp = firstFinite(sample?.timestamp, sample?.time, sample?.t, index * 20);
+    const gx = firstFinite(sample?.gx, sample?.gyroX, sample?.rx, 0);
+    const gy = firstFinite(sample?.gy, sample?.gyroY, sample?.ry, 0);
+    const gz = firstFinite(sample?.gz, sample?.gyroZ, sample?.rz, 0);
+    return {
+      timestamp,
+      ax: accel.ax,
+      ay: accel.ay,
+      az: accel.az,
+      gx,
+      gy,
+      gz,
+      accMagnitude: Math.hypot(accel.ax, accel.ay, accel.az),
+      gyroMagnitude: Math.hypot(gx, gy, gz),
+      rawPrimary: accel.value,
+      has3d: accel.has3d,
+    };
+  }).filter(Boolean);
+}
+
 // ---------------------------------------------------------------------------
 // Analyse, Rep-Erkennung und Referenzvergleich
 // ---------------------------------------------------------------------------
@@ -923,6 +1057,13 @@ function percentSimilarity(current, reference) {
 function percentDifference(current, reference) {
   if (!reference) return current ? 100 : 0;
   return ((current - reference) / Math.abs(reference)) * 100;
+}
+
+function comparisonSafePercentDifference(current, reference) {
+  const currentValue = Number(current) || 0;
+  const referenceValue = Number(reference) || 0;
+  if (Math.abs(referenceValue) < 0.05) return Math.max(0, currentValue - referenceValue) * 100;
+  return percentDifference(currentValue, referenceValue);
 }
 
 function estimateSampleInterval(data) {
@@ -953,6 +1094,87 @@ function percentile(values, fraction) {
 
 function clamp(value, minimum, maximum) {
   return Math.min(maximum, Math.max(minimum, value));
+}
+
+function mean(values) {
+  return average(values);
+}
+
+function variance(values) {
+  const valid = values.filter(Number.isFinite);
+  if (!valid.length) return 0;
+  const center = mean(valid);
+  return mean(valid.map((value) => (value - center) ** 2));
+}
+
+function std(values) {
+  return Math.sqrt(variance(values));
+}
+
+function dot(a, b) {
+  return (Number(a?.[0]) || 0) * (Number(b?.[0]) || 0) +
+    (Number(a?.[1]) || 0) * (Number(b?.[1]) || 0) +
+    (Number(a?.[2]) || 0) * (Number(b?.[2]) || 0);
+}
+
+function normalizeVec(vector) {
+  const x = Number(vector?.[0]) || 0;
+  const y = Number(vector?.[1]) || 0;
+  const z = Number(vector?.[2]) || 0;
+  const length = Math.hypot(x, y, z);
+  return length > 0.000001 ? [x / length, y / length, z / length] : [0, 0, 1];
+}
+
+function estimateSampleRate(timestamps = []) {
+  const intervalMs = estimateIntervalFromTimestamps(timestamps);
+  return intervalMs ? 1000 / intervalMs : 0;
+}
+
+function extractAccelSample(sample) {
+  if (Array.isArray(sample)) {
+    const ax = Number(sample[0]);
+    const ay = Number(sample[1]);
+    const az = Number(sample[2]);
+    if ([ax, ay, az].every(Number.isFinite)) return { ax, ay, az, has3d: true };
+    const value = Number(sample[0]);
+    return Number.isFinite(value) ? { ax: value, ay: 0, az: 0, value, has3d: false } : null;
+  }
+
+  if (Number.isFinite(Number(sample))) {
+    const value = Number(sample);
+    return { ax: value, ay: 0, az: 0, value, has3d: false };
+  }
+
+  if (!sample || typeof sample !== "object") return null;
+
+  const ax = firstFinite(sample.ax, sample.accelX, sample.x);
+  const ay = firstFinite(sample.ay, sample.accelY, sample.y);
+  const az = firstFinite(sample.az, sample.accelZ, sample.z);
+  if ([ax, ay, az].every(Number.isFinite)) return { ax, ay, az, has3d: true };
+
+  const value = firstFinite(sample.rawPrimary, sample.value, sample.acc, sample.accMagnitude, sample.magnitude);
+  if (Number.isFinite(value)) return { ax: value, ay: 0, az: 0, value, has3d: false };
+  return null;
+}
+
+function firstFinite(...values) {
+  for (const value of values) {
+    const number = Number(value);
+    if (Number.isFinite(number)) return number;
+  }
+  return NaN;
+}
+
+function lowPassIIR(values, timestamps, cutoffHz = 6) {
+  if (!values.length) return [];
+  const filtered = [Number(values[0]) || 0];
+  for (let index = 1; index < values.length; index += 1) {
+    const dt = Math.max((timestamps[index] - timestamps[index - 1]) / 1000, 0.001);
+    const rc = 1 / (2 * Math.PI * Math.max(0.1, cutoffHz));
+    const alpha = dt / (rc + dt);
+    filtered[index] = filtered[index - 1] + alpha * ((Number(values[index]) || 0) - filtered[index - 1]);
+  }
+  return filtered;
 }
 function emptyMetrics() {
   return {
@@ -1022,12 +1244,16 @@ function analyzeRecording(inputSamples) {
 function analyzeRecordingByMode(recordingData, exercise = null) {
   const inputSamples = Array.isArray(recordingData) ? recordingData : recordingData?.rawSamples;
   if (!Array.isArray(inputSamples) || inputSamples.length === 0) return emptyMetrics();
+  const mode = normalizeAnalysisMode(exercise?.analysisMode, exercise?.equipmentType);
+  if (mode === "weight_stack") {
+    const normalizedWeightStackSamples = normalizeWeightStackInputSamples(inputSamples);
+    if (!normalizedWeightStackSamples.length) return emptyMetrics();
+    return analyzeWeightStack(normalizedWeightStackSamples, exercise);
+  }
   const cleanSamples = inputSamples.filter((sample) =>
     ["timestamp", "ax", "ay", "az", "gx", "gy", "gz"].every((key) => Number.isFinite(Number(sample[key]))),
   );
   if (!cleanSamples.length) return emptyMetrics();
-  const mode = normalizeAnalysisMode(exercise?.analysisMode, exercise?.equipmentType);
-  if (mode === "weight_stack") return analyzeWeightStack(cleanSamples, exercise);
   if (mode === "barbell") return analyzeBarbell(cleanSamples, exercise);
   if (mode === "cable_handle") return analyzeCableHandle(cleanSamples, exercise);
   if (mode === "body_segment") {
@@ -1043,10 +1269,11 @@ function analyzeWeightStack(inputSamples, exercise) {
   return analyzeMode(inputSamples, exercise, {
     mode: "weight_stack",
     modeLabel: "Gewichtsblock / geführte Maschine",
-    primaryLabel: "Filtered dominant Acc",
-    secondaryLabel: "Gyro-Stabilität",
-    gyroPenalty: 1.25,
-    stabilityWeight: 0.16,
+    primaryLabel: "Bewegungssignal",
+    secondaryLabel: "Gyro / Debug",
+    gyroPenalty: 0,
+    stabilityWeight: 0,
+    weightStackOptions: exercise?.weightStackOptions || {},
   });
 }
 
@@ -1086,24 +1313,49 @@ function analyzeFreeMovement(inputSamples, exercise) {
 function analyzeMode(inputSamples, exercise, config) {
   const prepared = prepareModeSignals(inputSamples, exercise, config);
   const sensorQuality = validateSampleRate(prepared.samples, config.mode);
-  const repMarkers = detectRepsCycleBased(prepared.filteredPrimary, prepared.timestamps, {
-    minimumRepDurationMs: 700,
-    minimumRestMs: 120,
-  });
+
+  const repMarkers = config.mode === "weight_stack"
+    ? detectWeightStackRepsIMU(prepared.samples ?? inputSamples, prepared.timestamps, {
+        ...(config.weightStackOptions ?? {}),
+      })
+    : detectRepsCycleBased(prepared.filteredPrimary, prepared.timestamps, {
+        minimumRepDurationMs: 700,
+        minimumRestMs: 120,
+      });
+
+  const weightStackDebug = config.mode === "weight_stack" ? getWeightStackRepDebug() : null;
+
+  const primarySignal =
+    config.mode === "weight_stack" &&
+    weightStackDebug?.arrays?.position?.length === prepared.filteredPrimary.length
+      ? weightStackDebug.arrays.position
+      : config.mode === "weight_stack" &&
+          weightStackDebug?.arrays?.filteredAcc?.length === prepared.filteredPrimary.length
+        ? weightStackDebug.arrays.filteredAcc
+        : prepared.filteredPrimary;
+
+  const secondarySignal =
+    config.mode === "weight_stack" &&
+    weightStackDebug?.arrays?.velocity?.length === prepared.secondary.length
+      ? weightStackDebug.arrays.velocity
+      : prepared.secondary;
+
   const repSegments = segmentReps(prepared.samples, repMarkers).map((segment) => ({
     ...segment,
-    primary: prepared.filteredPrimary.slice(segment.startIndex, segment.endIndex + 1),
+    primary: primarySignal.slice(segment.startIndex, segment.endIndex + 1),
     highFrequency: prepared.highFrequency.slice(segment.startIndex, segment.endIndex + 1),
     gyroMagnitude: prepared.gyroMagnitude.slice(segment.startIndex, segment.endIndex + 1),
-    secondary: prepared.secondary.slice(segment.startIndex, segment.endIndex + 1),
+    secondary: secondarySignal.slice(segment.startIndex, segment.endIndex + 1),
     jerk: prepared.jerk.slice(segment.startIndex, Math.max(segment.startIndex, segment.endIndex)),
   }));
+
   const repMetrics = calculateRepMetrics(repSegments, config.mode);
   const referenceRepMetrics = exercise?.referenceRecording?.metrics?.repMetrics || [];
   applyVelocityLoss(repMetrics);
   applyRomRelativeToReference(repMetrics, referenceRepMetrics);
   const qualitySummary = classifyCleanReps(repMetrics, referenceRepMetrics, config.mode, sensorQuality);
-  const fatigue = detectFatigue(repMetrics, exercise?.referenceRecording?.metrics?.repMetrics || []);
+  const fatigue = detectFatigue(repMetrics, exercise?.referenceRecording?.metrics?.repMetrics || [], config.mode);
+  applyRepFeedback(repMetrics, fatigue, config.mode);
   const repDurations = repMetrics.map((rep) => rep.durationMs).filter((value) => value > 0);
   const repAmplitudes = repMetrics.map((rep) => rep.amplitudeProxy);
   const smoothnessScore = Math.round(clamp(average(repMetrics.map((rep) => rep.smoothnessScore)), 0, 100));
@@ -1116,17 +1368,24 @@ function analyzeMode(inputSamples, exercise, config) {
     ? Math.round(clamp(100 - (standardDeviation(repDurations) / Math.max(average(repDurations), 1)) * 240, 0, 100))
     : repDurations.length === 1 ? 55 : 0;
   const amplitudeEstimate = repAmplitudes.length
-    ? average(repAmplitudes)
-    : Math.max(0, percentile(prepared.filteredPrimary, 0.95) - percentile(prepared.filteredPrimary, 0.05));
-  const movementQualityScore = Math.round(clamp(
-    smoothnessScore * 0.34 +
-    tempoConsistencyScore * 0.18 +
-    stabilityScore * config.stabilityWeight +
-    clamp(100 - tremorScore * 18, 0, 100) * 0.18 +
-    (100 - fatigue.fatigueScore) * 0.08,
-    0,
-    100,
-  ));
+  ? average(repAmplitudes)
+  : Math.max(0, percentile(primarySignal, 0.95) - percentile(primarySignal, 0.05));
+  const movementQualityScore = config.mode === "weight_stack"
+    ? calculateWeightStackScore({
+        repMetrics,
+        referenceRepMetrics,
+        tempoConsistencyScore,
+        tremorScore,
+      })
+    : Math.round(clamp(
+        smoothnessScore * 0.34 +
+        tempoConsistencyScore * 0.18 +
+        stabilityScore * config.stabilityWeight +
+        clamp(100 - tremorScore * 18, 0, 100) * 0.18 +
+        (100 - fatigue.fatigueScore) * 0.08,
+        0,
+        100,
+      ));
   const preliminaryAnalysis = {
     ...emptyMetrics(),
     reps: repMetrics.length,
@@ -1184,13 +1443,14 @@ function analyzeMode(inputSamples, exercise, config) {
     repAmplitudes,
     fatigue,
     feedbackEvents: buildFeedbackEvents({ repMetrics, fatigue, sensorQuality }, null),
+    weightStackDebug,
     signals: {
-      primary: prepared.filteredPrimary,
-      secondary: prepared.secondary,
+      primary: primarySignal,
+      secondary: secondarySignal,
       timestamps: prepared.timestamps,
-      primaryLabel: config.primaryLabel,
-      secondaryLabel: config.secondaryLabel,
-    },
+      primaryLabel: config.mode === "weight_stack" ? "ROM-/Position-Proxy" : config.primaryLabel,
+      secondaryLabel: config.mode === "weight_stack" ? "Velocity-Proxy" : config.secondaryLabel,
+},
   };
 }
 
@@ -1202,15 +1462,22 @@ function prepareModeSignals(inputSamples, exercise, config) {
   const rawPrimary = config.mode === "free_movement" || config.mode === "body_segment"
     ? samplesWithBias.map((sample) => Math.hypot(sample.ax, sample.ay, sample.az))
     : samplesWithBias.map((sample) => sample[dominantAxis]);
-  const filteredPrimary = movingAverage(lowPassFilter(rawPrimary, alpha), 5);
+  const lowPassedPrimary = movingAverage(lowPassFilter(rawPrimary, alpha), 5);
+  const baselineWindow = Math.max(9, Math.round(1200 / estimateIntervalFromTimestamps(timestamps)));
+  const baseline = movingAverage(lowPassedPrimary, baselineWindow);
+  const filteredPrimary = config.mode === "weight_stack"
+    ? lowPassedPrimary.map((value, index) => value - baseline[index])
+    : lowPassedPrimary;
   const gyroMagnitude = samplesWithBias.map((sample) => Math.hypot(sample.gx, sample.gy, sample.gz));
   return {
     samples: samplesWithBias,
     timestamps,
     dominantAxis,
     rawPrimary,
+    lowPassedPrimary,
+    baseline,
     filteredPrimary,
-    highFrequency: highPassFromLowPass(rawPrimary, filteredPrimary),
+    highFrequency: highPassFromLowPass(rawPrimary, lowPassedPrimary),
     jerk: calculateJerk(filteredPrimary, timestamps),
     gyroMagnitude,
     accMagnitude: samplesWithBias.map((sample) => Math.hypot(sample.ax, sample.ay, sample.az)),
@@ -1292,6 +1559,1496 @@ function calculateJerk(values, timestamps) {
   return result;
 }
 
+function getWeightStackRepDebug() {
+  return lastWeightStackRepDebug;
+}
+
+function mergeWeightStackOptions(options = {}) {
+  const requestedProfile = options.exerciseKey || "default";
+  const profile = options.enableExerciseProfiles === false
+    ? {}
+    : WEIGHT_STACK_EXERCISE_PROFILES[requestedProfile] || WEIGHT_STACK_EXERCISE_PROFILES.default;
+  return {
+    ...defaultWeightStackOptions,
+    ...profile,
+    ...options,
+    exerciseKey: requestedProfile,
+  };
+}
+
+function hasNumericWeightStackOption(value) {
+  return value !== null && value !== undefined && value !== "" && Number.isFinite(Number(value));
+}
+
+function detectWeightStackRepsIMU(samples, timestamps = [], options = {}) {
+  const optionsUsed = mergeWeightStackOptions(options);
+  const input = Array.isArray(samples) ? samples : [];
+  const resolvedTimestamps = resolveWeightStackTimestamps(input, timestamps);
+  const sampleRate = estimateSampleRate(resolvedTimestamps);
+  const rejectedCandidates = [];
+
+  const extracted = input.map(extractAccelSample);
+  const validIndexes = extracted
+    .map((sample, index) => sample ? index : -1)
+    .filter((index) => index >= 0 && Number.isFinite(resolvedTimestamps[index]));
+
+  if (validIndexes.length < 8) {
+    lastWeightStackRepDebug = buildWeightStackDebug({
+      mode: "fallback_1d",
+      warning: "Too few valid samples for weight-stack IMU detection.",
+      optionsUsed,
+      sampleCount: input.length,
+      timestampCount: resolvedTimestamps.length,
+      estimatedSampleRate: sampleRate,
+      reps: [],
+      rejectedCandidates,
+    });
+    return [];
+  }
+
+  const accel = validIndexes.map((index) => extracted[index]);
+  const localTimestamps = validIndexes.map((index) => resolvedTimestamps[index]);
+  const has3dRatio = accel.filter((sample) => sample.has3d).length / accel.length;
+  const use3d = has3dRatio >= 0.8 && optionsUsed.enable3DProjection !== false;
+  const mode = use3d ? "imu_3d" : "fallback_1d";
+  const warning = use3d ? null : "Only 1D signal available; 3D IMU projection disabled.";
+  const restSampleCount = estimateRestSampleCount(localTimestamps, optionsUsed.restMs);
+  const restSlice = accel.slice(0, restSampleCount);
+
+  const g0 = use3d && optionsUsed.enableRestCalibration
+    ? [
+        mean(restSlice.map((sample) => sample.ax)),
+        mean(restSlice.map((sample) => sample.ay)),
+        mean(restSlice.map((sample) => sample.az)),
+      ]
+    : [0, 0, 0];
+
+  const oneDBias = !use3d && optionsUsed.enableRestCalibration
+    ? mean(restSlice.map((sample) => Number(sample.value ?? sample.ax) || 0))
+    : 0;
+
+  const linear = accel.map((sample) => use3d
+    ? [sample.ax - g0[0], sample.ay - g0[1], sample.az - g0[2]]
+    : [Number(sample.value ?? sample.ax) - oneDBias, 0, 0],
+  );
+
+  const restLinear = linear.slice(0, restSampleCount);
+  const axisVariance = use3d
+    ? [
+        variance(linear.slice(restSampleCount).map((value) => value[0])),
+        variance(linear.slice(restSampleCount).map((value) => value[1])),
+        variance(linear.slice(restSampleCount).map((value) => value[2])),
+      ]
+    : [variance(linear.map((value) => value[0])), 0, 0];
+  const dominantAxisIndex = axisVariance.indexOf(Math.max(...axisVariance));
+  const dominantAxis = ["ax", "ay", "az"][dominantAxisIndex] || "ax";
+  const movementAxis = use3d && optionsUsed.enableAutoAxisDetection !== false && optionsUsed.enable3DProjection !== false
+    ? normalizeVec([
+        dominantAxisIndex === 0 ? 1 : 0,
+        dominantAxisIndex === 1 ? 1 : 0,
+        dominantAxisIndex === 2 ? 1 : 0,
+      ])
+    : [1, 0, 0];
+
+  let projectedAcc = use3d && optionsUsed.enable3DProjection !== false
+    ? linear.map((value) => dot(value, movementAxis))
+    : linear.map((value) => value[0]);
+
+  if (Math.abs(percentile(projectedAcc, 0.05)) > Math.abs(percentile(projectedAcc, 0.95))) {
+    projectedAcc = projectedAcc.map((value) => -value);
+  }
+
+  const restProjected = projectedAcc.slice(0, restSampleCount);
+  const restSigma = optionsUsed.enableRestCalibration ? std(restProjected) : std(projectedAcc.slice(0, Math.min(20, projectedAcc.length)));
+  const filteredAcc = optionsUsed.enableLowPassFilter
+    ? lowPassIIR(projectedAcc, localTimestamps, optionsUsed.cutoffHz)
+    : projectedAcc.slice();
+  const kinematics = integrateWeightStackSignal(filteredAcc, localTimestamps, restSigma, optionsUsed);
+  let { velocity, position } = kinematics;
+  if (optionsUsed.enablePositionProxy !== false) {
+    const baselineWindow = Math.max(9, Math.round(2200 / Math.max(estimateIntervalFromTimestamps(localTimestamps), 1)));
+    const positionBaseline = movingAverage(position, baselineWindow);
+    position = position.map((value, index) => value - positionBaseline[index]);
+  }
+
+  if (Math.abs(percentile(position, 0.05)) > Math.abs(percentile(position, 0.95))) {
+    position = position.map((value) => -value);
+    velocity = velocity.map((value) => -value);
+  }
+
+  const positionRange = percentile(position, 0.95) - percentile(position, 0.05);
+  const activityThreshold = optionsUsed.enableAdaptiveThresholds
+    ? Math.max(optionsUsed.minActivityG, 5 * restSigma)
+    : optionsUsed.minActivityG;
+  const velocityAbs = velocity.map(Math.abs);
+  const velocityThreshold = hasNumericWeightStackOption(optionsUsed.startVelocityThreshold)
+    ? Number(optionsUsed.startVelocityThreshold)
+    : Math.max(percentile(velocityAbs, 0.62), activityThreshold * 0.06, 0.0003);
+  const minAmplitude = hasNumericWeightStackOption(optionsUsed.minAmplitude)
+    ? Number(optionsUsed.minAmplitude)
+    : Math.max(positionRange * 0.22, activityThreshold * 0.012, 0.0005);
+
+  const stateResult = optionsUsed.enableStateMachine
+    ? runWeightStackStateMachine({
+        position,
+        velocity,
+        filteredAcc,
+        timestamps: localTimestamps,
+        options: optionsUsed,
+        thresholds: { activityThreshold, velocityThreshold, minAmplitude },
+      })
+    : runWeightStackSimpleCycleFallback({
+        position,
+        velocity,
+        filteredAcc,
+        timestamps: localTimestamps,
+        options: optionsUsed,
+        thresholds: { activityThreshold, velocityThreshold, minAmplitude },
+      });
+
+  const reps = enrichWeightStackReps(stateResult.reps, {
+    filteredAcc,
+    velocity,
+    position,
+    timestamps: localTimestamps,
+    options: optionsUsed,
+  });
+
+  const mappedReps = reps.map((rep) => mapWeightStackRepIndexes(rep, validIndexes));
+
+  lastWeightStackRepDebug = buildWeightStackDebug({
+    mode,
+    warning,
+    optionsUsed,
+    sampleCount: input.length,
+    timestampCount: resolvedTimestamps.length,
+    estimatedSampleRate: sampleRate,
+    calibration: {
+      restMs: optionsUsed.restMs,
+      restSampleCount,
+      g0: use3d ? { ax: g0[0], ay: g0[1], az: g0[2] } : { value: oneDBias },
+      restSigma,
+    },
+    axis: {
+      movementAxis,
+      dominantAxis,
+      variance: { ax: axisVariance[0], ay: axisVariance[1], az: axisVariance[2] },
+    },
+    thresholds: {
+      activityThreshold,
+      velocityThreshold,
+      minAmplitude,
+    },
+    arrays: {
+      projectedAcc,
+      filteredAcc,
+      velocity,
+      position,
+      stateByIndex: stateResult.stateByIndex,
+    },
+    reps: mappedReps,
+    rejectedCandidates: [...rejectedCandidates, ...stateResult.rejectedCandidates],
+    optionalFeatures: {
+      gyroAssist: detectGyroAvailability(input, validIndexes, optionsUsed.enableGyroAssist),
+      autocorrelationHint: optionsUsed.enableAutocorrelationHint
+        ? estimateAutocorrelationCycleHint(position, localTimestamps)
+        : { enabled: false, note: "Prepared only; disabled by toggle." },
+      templateMatching: optionsUsed.enableTemplateMatching
+        ? { enabled: true, note: "Template matching placeholder; reference-template distance is not score-critical yet." }
+        : { enabled: false, note: "Prepared only; disabled by toggle." },
+    },
+  });
+
+  return mappedReps;
+}
+
+function resolveWeightStackTimestamps(samples, timestamps = []) {
+  if (Array.isArray(timestamps) && timestamps.length === samples.length) {
+    return timestamps.map((value, index) => Number.isFinite(Number(value)) ? Number(value) : index * 20);
+  }
+  return samples.map((sample, index) => {
+    const value = Number(sample?.timestamp ?? sample?.time ?? sample?.t);
+    return Number.isFinite(value) ? value : index * 20;
+  });
+}
+
+function estimateRestSampleCount(timestamps, restMs) {
+  if (!timestamps.length) return 0;
+  const start = timestamps[0];
+  const count = timestamps.findIndex((timestamp) => timestamp - start > restMs);
+  if (count > 3) return count;
+  return Math.max(3, Math.min(timestamps.length, Math.round(restMs / Math.max(estimateIntervalFromTimestamps(timestamps), 1))));
+}
+
+function integrateWeightStackSignal(filteredAcc, timestamps, restSigma, options) {
+  const velocity = new Array(filteredAcc.length).fill(0);
+  const position = new Array(filteredAcc.length).fill(0);
+  const restThreshold = Math.max(options.minActivityG * 0.5, restSigma * 2);
+  for (let index = 1; index < filteredAcc.length; index += 1) {
+    const dt = Math.max((timestamps[index] - timestamps[index - 1]) / 1000, 0.001);
+    const acceleration = Number(filteredAcc[index]) || 0;
+    velocity[index] = options.enableVelocityIntegration === false
+      ? acceleration
+      : velocity[index - 1] * options.leak + acceleration * dt;
+    if (Math.abs(acceleration) < restThreshold) {
+      velocity[index] *= 0.92;
+    }
+    position[index] = options.enablePositionProxy === false
+      ? filteredAcc[index]
+      : position[index - 1] + velocity[index] * dt;
+  }
+  return { velocity, position };
+}
+
+function runWeightStackStateMachine({ position, velocity, filteredAcc, timestamps, options, thresholds }) {
+  const stateByIndex = new Array(position.length).fill("REST_BOTTOM");
+  const rejectedCandidates = [];
+  const reps = [];
+  const bottomLevel = percentile(position, 0.08);
+  const startThreshold = bottomLevel + thresholds.minAmplitude * 0.45;
+  const bottomThreshold = bottomLevel + thresholds.minAmplitude * 0.28;
+  let state = "REST_BOTTOM";
+  let candidate = null;
+  let lastRepEndTime = -Infinity;
+
+  const reject = (reason, extra = {}) => {
+    if (candidate) {
+      rejectedCandidates.push({
+        reason,
+        startIndex: candidate.startIndex,
+        endIndex: extra.endIndex ?? null,
+        durationMs: extra.durationMs ?? null,
+        amplitude: extra.amplitude ?? null,
+      });
+    }
+    candidate = null;
+    state = "REST_BOTTOM";
+  };
+
+  const finish = (endIndex) => {
+    const durationMs = timestamps[endIndex] - timestamps[candidate.startIndex];
+    const upMs = timestamps[candidate.topIndex] - timestamps[candidate.upStartIndex];
+    const downMs = timestamps[endIndex] - timestamps[candidate.downStartIndex];
+    const amplitude = Math.max(...position.slice(candidate.startIndex, endIndex + 1)) -
+      Math.min(...position.slice(candidate.startIndex, endIndex + 1));
+    const valid = durationMs >= options.minRepMs &&
+      durationMs <= options.maxRepMs &&
+      upMs >= options.minPhaseMs &&
+      downMs >= options.minPhaseMs &&
+      amplitude >= thresholds.minAmplitude &&
+      timestamps[endIndex] - lastRepEndTime >= options.refractoryMs;
+
+    if (!valid) {
+      reject("validation_failed", { endIndex, durationMs, amplitude });
+      return;
+    }
+
+    reps.push({
+      startIndex: candidate.startIndex,
+      endIndex,
+      startTime: timestamps[candidate.startIndex],
+      endTime: timestamps[endIndex],
+      startTimestamp: timestamps[candidate.startIndex],
+      endTimestamp: timestamps[endIndex],
+      durationMs,
+      upStartIndex: candidate.upStartIndex,
+      topIndex: candidate.topIndex,
+      peakIndex: candidate.topIndex,
+      downStartIndex: candidate.downStartIndex,
+      bottomIndex: endIndex,
+      upMs,
+      downMs,
+      topPauseMs: Math.max(0, timestamps[candidate.downStartIndex] - timestamps[candidate.topIndex]),
+      bottomPauseMs: 0,
+      amplitude,
+      peakVelocity: Math.max(...velocity.slice(candidate.startIndex, endIndex + 1).map(Math.abs)),
+      meanVelocity: mean(velocity.slice(candidate.startIndex, endIndex + 1).map(Math.abs)),
+      qualityFlags: {
+        partialRep: false,
+        tooFastDown: false,
+        droppedWeight: false,
+        jerky: false,
+        suspicious: false,
+      },
+    });
+    lastRepEndTime = timestamps[endIndex];
+    candidate = null;
+    state = "REST_BOTTOM";
+  };
+
+  for (let index = 1; index < position.length; index += 1) {
+    const pos = position[index];
+    const vel = velocity[index];
+    const timestamp = timestamps[index];
+    stateByIndex[index] = state;
+
+    if (state === "REST_BOTTOM") {
+      if (timestamp - lastRepEndTime < options.refractoryMs) continue;
+      if (pos > startThreshold && vel > thresholds.velocityThreshold * 0.25) {
+        candidate = {
+          startIndex: findWeightStackBottomStart(position, index, bottomThreshold),
+          upStartIndex: index,
+          topIndex: index,
+          downStartIndex: index,
+        };
+        state = "MOVING_UP";
+      }
+      continue;
+    }
+
+    if (!candidate) {
+      state = "REST_BOTTOM";
+      continue;
+    }
+
+    const candidateDuration = timestamp - timestamps[candidate.startIndex];
+    if (candidateDuration > options.maxRepMs) {
+      reject("timeout", { endIndex: index, durationMs: candidateDuration });
+      continue;
+    }
+
+    if (state === "MOVING_UP") {
+      if (pos >= position[candidate.topIndex]) candidate.topIndex = index;
+      const upMs = timestamp - timestamps[candidate.upStartIndex];
+      if (upMs >= options.minPhaseMs && vel <= thresholds.velocityThreshold * 0.15) {
+        state = "TOP_TURN";
+      }
+      continue;
+    }
+
+    if (state === "TOP_TURN") {
+      if (pos >= position[candidate.topIndex]) candidate.topIndex = index;
+      if (vel < -thresholds.velocityThreshold * 0.2) {
+        candidate.downStartIndex = index;
+        state = "MOVING_DOWN";
+      }
+      continue;
+    }
+
+    if (state === "MOVING_DOWN") {
+      const downMs = timestamp - timestamps[candidate.downStartIndex];
+      if (downMs >= options.minPhaseMs && pos <= bottomThreshold && Math.abs(vel) <= thresholds.velocityThreshold * 1.4) {
+        state = "BOTTOM_TURN";
+        finish(index);
+      }
+    }
+  }
+
+  return { reps, rejectedCandidates, stateByIndex };
+}
+
+function runWeightStackSimpleCycleFallback({ position, velocity, filteredAcc, timestamps, options, thresholds }) {
+  const stateByIndex = new Array(position.length).fill("SIMPLE_CYCLE");
+  const rejectedCandidates = [];
+  const reps = [];
+  const low = percentile(position, 0.08);
+  const startThreshold = low + thresholds.minAmplitude * 0.5;
+  const endThreshold = low + thresholds.minAmplitude * 0.3;
+  let active = false;
+  let startIndex = 0;
+  let topIndex = 0;
+  let lastEnd = -Infinity;
+  for (let index = 0; index < position.length; index += 1) {
+    if (!active && position[index] > startThreshold && timestamps[index] - lastEnd >= options.refractoryMs) {
+      active = true;
+      startIndex = findWeightStackBottomStart(position, index, endThreshold);
+      topIndex = index;
+      continue;
+    }
+    if (!active) continue;
+    if (position[index] > position[topIndex]) topIndex = index;
+    if (index > topIndex && position[index] <= endThreshold) {
+      const durationMs = timestamps[index] - timestamps[startIndex];
+      const amplitude = position[topIndex] - Math.min(...position.slice(startIndex, index + 1));
+      if (durationMs >= options.minRepMs && durationMs <= options.maxRepMs && amplitude >= thresholds.minAmplitude) {
+        reps.push({
+          startIndex,
+          endIndex: index,
+          startTime: timestamps[startIndex],
+          endTime: timestamps[index],
+          startTimestamp: timestamps[startIndex],
+          endTimestamp: timestamps[index],
+          durationMs,
+          upStartIndex: startIndex,
+          topIndex,
+          peakIndex: topIndex,
+          downStartIndex: topIndex,
+          bottomIndex: index,
+          upMs: timestamps[topIndex] - timestamps[startIndex],
+          downMs: timestamps[index] - timestamps[topIndex],
+          topPauseMs: 0,
+          bottomPauseMs: 0,
+          amplitude,
+          peakVelocity: Math.max(...velocity.slice(startIndex, index + 1).map(Math.abs)),
+          meanVelocity: mean(velocity.slice(startIndex, index + 1).map(Math.abs)),
+          qualityFlags: { partialRep: false, tooFastDown: false, droppedWeight: false, jerky: false, suspicious: false },
+        });
+        lastEnd = timestamps[index];
+      } else {
+        rejectedCandidates.push({ reason: "simple_cycle_validation_failed", startIndex, endIndex: index, durationMs, amplitude });
+      }
+      active = false;
+    }
+  }
+  return { reps, rejectedCandidates, stateByIndex };
+}
+
+function findWeightStackBottomStart(position, index, bottomThreshold) {
+  for (let i = index; i >= Math.max(0, index - 20); i -= 1) {
+    if (position[i] <= bottomThreshold) return i;
+  }
+  return Math.max(0, index - 2);
+}
+
+function enrichWeightStackReps(reps, { filteredAcc, velocity, position, timestamps, options }) {
+  const baselinePool = reps.slice(0, Math.min(3, reps.length)).map((rep) => rep.amplitude).filter((value) => value > 0);
+  const baselineAmplitude = options.enableRomBaseline && baselinePool.length ? mean(baselinePool) : 0;
+  const bestPeakVelocity = Math.max(...reps.map((rep) => rep.peakVelocity || 0), 0);
+  return reps.map((rep) => {
+    const accSlice = filteredAcc.slice(rep.startIndex, rep.endIndex + 1);
+    const jerkValues = calculateJerk(accSlice, timestamps.slice(rep.startIndex, rep.endIndex + 1));
+    const jerkRms = rms(jerkValues);
+    const romRatio = baselineAmplitude ? rep.amplitude / baselineAmplitude : null;
+    const velocityLoss = options.enableVelocityLoss && bestPeakVelocity
+      ? clamp(1 - (rep.peakVelocity || 0) / bestPeakVelocity, 0, 1)
+      : 0;
+    const bottomWindow = accSlice.slice(Math.max(0, accSlice.length - 8));
+    const droppedWeight = options.enableDroppedWeightDetection &&
+      Math.max(...bottomWindow.map(Math.abs), 0) > options.droppedWeightSpikeG;
+    const jerkThreshold = hasNumericWeightStackOption(options.jerkThreshold)
+      ? Number(options.jerkThreshold)
+      : Math.max(rms(filteredAcc) * 3.5, 0.35);
+    const partialRep = Boolean(options.enablePartialRepDetection && romRatio !== null && romRatio < options.partialRepRomRatio);
+    const tooFastDown = Boolean(options.enableTempoFlags && rep.downMs < options.controlledDownMinMs);
+    const jerky = Boolean(options.enableJerkDetection && jerkRms > jerkThreshold);
+    return {
+      ...rep,
+      romRatio,
+      velocityLoss,
+      jerkRms,
+      qualityFlags: {
+        ...rep.qualityFlags,
+        partialRep,
+        tooFastDown,
+        droppedWeight,
+        jerky,
+        suspicious: partialRep || tooFastDown || droppedWeight || jerky,
+      },
+    };
+  });
+}
+
+function mapWeightStackRepIndexes(rep, indexMap) {
+  const mapIndex = (index) => indexMap[Math.max(0, Math.min(indexMap.length - 1, index))] ?? index;
+  return {
+    ...rep,
+    startIndex: mapIndex(rep.startIndex),
+    endIndex: mapIndex(rep.endIndex),
+    upStartIndex: mapIndex(rep.upStartIndex),
+    topIndex: mapIndex(rep.topIndex),
+    peakIndex: mapIndex(rep.peakIndex ?? rep.topIndex),
+    downStartIndex: mapIndex(rep.downStartIndex),
+    bottomIndex: mapIndex(rep.bottomIndex),
+  };
+}
+
+function detectGyroAvailability(samples, validIndexes, enabled = false) {
+  const gyroMagnitudes = validIndexes.map((index) => {
+    const sample = samples[index];
+    const gx = Number(sample?.gx);
+    const gy = Number(sample?.gy);
+    const gz = Number(sample?.gz);
+    return [gx, gy, gz].some(Number.isFinite) ? Math.hypot(gx || 0, gy || 0, gz || 0) : null;
+  }).filter(Number.isFinite);
+  const hasGyro = gyroMagnitudes.length > 0;
+  return {
+    enabled: Boolean(enabled),
+    available: hasGyro,
+    gyroRms: hasGyro ? rms(gyroMagnitudes) : 0,
+    note: hasGyro
+      ? "Gyro detected. GyroAssist is debug-only for weight_stack and does not drive primary rep counting."
+      : "No gyro fields detected.",
+  };
+}
+
+function estimateAutocorrelationCycleHint(values, timestamps) {
+  if (!values.length || values.length < 20) return { enabled: true, estimatedCycleMs: null, confidence: 0 };
+  const intervalMs = estimateIntervalFromTimestamps(timestamps);
+  const centered = values.map((value) => value - mean(values));
+  let bestLag = 0;
+  let bestScore = -Infinity;
+  const minLag = Math.max(3, Math.round(600 / intervalMs));
+  const maxLag = Math.min(centered.length - 2, Math.round(5000 / intervalMs));
+  for (let lag = minLag; lag <= maxLag; lag += 1) {
+    let score = 0;
+    for (let index = lag; index < centered.length; index += 1) score += centered[index] * centered[index - lag];
+    if (score > bestScore) {
+      bestScore = score;
+      bestLag = lag;
+    }
+  }
+  return {
+    enabled: true,
+    estimatedCycleMs: bestLag ? bestLag * intervalMs : null,
+    confidence: bestScore > 0 ? 0.4 : 0,
+    note: "Hint only; state machine remains primary.",
+  };
+}
+
+function buildWeightStackDebug(debug) {
+  const arrays = debug.arrays || {};
+  const keepArrays = debug.optionsUsed?.debugKeepArrays !== false;
+  return {
+    mode: debug.mode,
+    warning: debug.warning ?? null,
+    optionsUsed: debug.optionsUsed,
+    sampleCount: debug.sampleCount ?? 0,
+    timestampCount: debug.timestampCount ?? 0,
+    estimatedSampleRate: debug.estimatedSampleRate ?? 0,
+    calibration: debug.calibration || {
+      restMs: debug.optionsUsed?.restMs ?? 0,
+      restSampleCount: 0,
+      g0: null,
+      restSigma: 0,
+    },
+    axis: debug.axis || {
+      movementAxis: null,
+      dominantAxis: null,
+      variance: null,
+    },
+    thresholds: debug.thresholds || {
+      activityThreshold: 0,
+      velocityThreshold: 0,
+      minAmplitude: 0,
+    },
+    arrays: keepArrays
+      ? arrays
+      : Object.fromEntries(Object.entries(arrays).map(([key, value]) => [
+          key,
+          Array.isArray(value) ? value.slice(-80) : value,
+        ])),
+    reps: debug.reps || [],
+    rejectedCandidates: debug.rejectedCandidates || [],
+    optionalFeatures: debug.optionalFeatures || {},
+  };
+}
+
+let lastWeightStackKinematicsDebug = null;
+
+function getWeightStackKinematicsDebug() {
+  return lastWeightStackKinematicsDebug;
+}
+
+function buildWeightStackKinematics(inputSamples, calibrationProfile = null) {
+  if (!Array.isArray(inputSamples) || inputSamples.length < 20) return null;
+
+  const samples = inputSamples
+    .map((sample) => ({
+      timestamp: Number(sample.timestamp),
+      ax: Number(sample.ax),
+      ay: Number(sample.ay),
+      az: Number(sample.az),
+      gx: Number(sample.gx),
+      gy: Number(sample.gy),
+      gz: Number(sample.gz),
+    }))
+    .filter((sample) =>
+      ["timestamp", "ax", "ay", "az", "gx", "gy", "gz"].every((key) =>
+        Number.isFinite(sample[key])
+      )
+    );
+
+  if (samples.length < 20) return null;
+
+  const timestamps = samples.map((sample) => sample.timestamp);
+  const intervalMs = estimateIntervalFromTimestamps(timestamps) || 20;
+  const calibrationBias = calibrationProfile?.bias || {};
+
+  const restWindowCount = Math.max(
+    8,
+    Math.min(samples.length, Math.round(700 / intervalMs))
+  );
+
+  const restSamples = samples.slice(0, restWindowCount);
+
+  const restAcc = {
+    x: Number.isFinite(Number(calibrationBias.ax))
+      ? Number(calibrationBias.ax)
+      : average(restSamples.map((sample) => sample.ax)),
+    y: Number.isFinite(Number(calibrationBias.ay))
+      ? Number(calibrationBias.ay)
+      : average(restSamples.map((sample) => sample.ay)),
+    z: Number.isFinite(Number(calibrationBias.az))
+      ? Number(calibrationBias.az)
+      : average(restSamples.map((sample) => sample.az)),
+  };
+
+  const gyroBias = {
+    x: Number.isFinite(Number(calibrationBias.gx))
+      ? Number(calibrationBias.gx)
+      : average(restSamples.map((sample) => sample.gx)),
+    y: Number.isFinite(Number(calibrationBias.gy))
+      ? Number(calibrationBias.gy)
+      : average(restSamples.map((sample) => sample.gy)),
+    z: Number.isFinite(Number(calibrationBias.gz))
+      ? Number(calibrationBias.gz)
+      : average(restSamples.map((sample) => sample.gz)),
+  };
+
+  const restGravityMagnitude = Math.max(
+    0.65,
+    Math.min(1.35, Math.hypot(restAcc.x, restAcc.y, restAcc.z) || 1)
+  );
+
+  const filter = new Mahony6DofFilter({
+    sampleIntervalSeconds: intervalMs / 1000,
+    kp: 1.4,
+    ki: 0.015,
+    initialAcc: restAcc,
+  });
+
+  const linearAccWorld = [];
+  const velocityWorld = [];
+  const positionWorld = [];
+
+  let vx = 0;
+  let vy = 0;
+  let vz = 0;
+
+  let px = 0;
+  let py = 0;
+  let pz = 0;
+
+  let stillCounter = 0;
+
+  const accDeadbandG = 0.018;
+  const stillAccThresholdG = 0.035;
+  const stillGyroThresholdDps = 4.0;
+  const zuptHoldMs = 180;
+  const zuptHoldSamples = Math.max(3, Math.round(zuptHoldMs / intervalMs));
+
+  const velocityLeakTauSeconds = 5.0;
+  const positionLeakTauSeconds = 18.0;
+
+  for (let index = 0; index < samples.length; index += 1) {
+    const sample = samples[index];
+    const previous = samples[Math.max(0, index - 1)];
+
+    const dt =
+      index === 0
+        ? intervalMs / 1000
+        : Math.max((sample.timestamp - previous.timestamp) / 1000, 0.001);
+
+    const gx = sample.gx - gyroBias.x;
+    const gy = sample.gy - gyroBias.y;
+    const gz = sample.gz - gyroBias.z;
+
+    filter.update({
+      gxDps: gx,
+      gyDps: gy,
+      gzDps: gz,
+      ax: sample.ax,
+      ay: sample.ay,
+      az: sample.az,
+      dt,
+    });
+
+    const gravity = filter.getGravityVectorSensorFrame(restGravityMagnitude);
+
+    const linearSensor = {
+      x: sample.ax - gravity.x,
+      y: sample.ay - gravity.y,
+      z: sample.az - gravity.z,
+    };
+
+    const linearWorld = filter.rotateSensorVectorToWorld(linearSensor);
+
+    linearWorld.x = applyDeadband(linearWorld.x, accDeadbandG);
+    linearWorld.y = applyDeadband(linearWorld.y, accDeadbandG);
+    linearWorld.z = applyDeadband(linearWorld.z, accDeadbandG);
+
+    const gyroMagnitude = Math.hypot(gx, gy, gz);
+    const accMagnitude = Math.hypot(linearWorld.x, linearWorld.y, linearWorld.z);
+
+    const looksStill =
+      accMagnitude < stillAccThresholdG &&
+      gyroMagnitude < stillGyroThresholdDps;
+
+    if (looksStill) {
+      stillCounter += 1;
+    } else {
+      stillCounter = 0;
+    }
+
+    const velocityLeak = Math.exp(-dt / velocityLeakTauSeconds);
+    const positionLeak = Math.exp(-dt / positionLeakTauSeconds);
+
+    vx = vx * velocityLeak + linearWorld.x * dt;
+    vy = vy * velocityLeak + linearWorld.y * dt;
+    vz = vz * velocityLeak + linearWorld.z * dt;
+
+    if (stillCounter >= zuptHoldSamples) {
+      vx = 0;
+      vy = 0;
+      vz = 0;
+    }
+
+    px = px * positionLeak + vx * dt;
+    py = py * positionLeak + vy * dt;
+    pz = pz * positionLeak + vz * dt;
+
+    linearAccWorld.push({
+      x: linearWorld.x,
+      y: linearWorld.y,
+      z: linearWorld.z,
+    });
+
+    velocityWorld.push({
+      x: vx,
+      y: vy,
+      z: vz,
+    });
+
+    positionWorld.push({
+      x: px,
+      y: py,
+      z: pz,
+    });
+  }
+
+  const axisInfo = determineBestKinematicAxis(
+    positionWorld,
+    velocityWorld,
+    linearAccWorld
+  );
+
+  let positionProxy = positionWorld.map((value) => value[axisInfo.axis]);
+  let velocityProxy = velocityWorld.map((value) => value[axisInfo.axis]);
+  let linearAccProxy = linearAccWorld.map((value) => value[axisInfo.axis]);
+
+  if (axisInfo.sign < 0) {
+    positionProxy = positionProxy.map((value) => -value);
+    velocityProxy = velocityProxy.map((value) => -value);
+    linearAccProxy = linearAccProxy.map((value) => -value);
+  }
+
+  const positionBaseline = percentile(
+    positionProxy.slice(0, restWindowCount),
+    0.5
+  );
+  positionProxy = positionProxy.map((value) => value - positionBaseline);
+
+  const velocityBaseline = percentile(
+    velocityProxy.slice(0, restWindowCount),
+    0.5
+  );
+  velocityProxy = velocityProxy.map((value) => value - velocityBaseline);
+
+  const linearAccBaseline = percentile(
+    linearAccProxy.slice(0, restWindowCount),
+    0.5
+  );
+  linearAccProxy = linearAccProxy.map((value) => value - linearAccBaseline);
+
+  positionProxy = movingAverage(
+    positionProxy,
+    Math.max(3, Math.round(80 / intervalMs))
+  );
+
+  velocityProxy = movingAverage(
+    velocityProxy,
+    Math.max(3, Math.round(60 / intervalMs))
+  );
+
+  linearAccProxy = movingAverage(
+    linearAccProxy,
+    Math.max(3, Math.round(40 / intervalMs))
+  );
+
+  const fallbackGithub = buildGithubInspiredKinematics(samples, calibrationProfile);
+
+  const result = {
+    method: "mahony_6dof_velocity_position_proxy",
+    timestamps,
+    axis: axisInfo.axis,
+    axisSign: axisInfo.sign,
+    restAcc,
+    gyroBias,
+    linearAccWorld,
+    linearAccProxy,
+    velocityProxy,
+    positionProxy,
+    positionWorld,
+    velocityWorld,
+    fallbackGithub,
+  };
+
+  lastWeightStackKinematicsDebug = result;
+  return result;
+}
+
+function determineBestKinematicAxis(positionWorld, velocityWorld, linearAccWorld) {
+  const axes = ["x", "y", "z"];
+
+  const scores = axes.map((axis) => {
+    const positionValues = positionWorld.map((value) => value[axis]);
+    const velocityValues = velocityWorld.map((value) => value[axis]);
+    const accValues = linearAccWorld.map((value) => value[axis]);
+
+    const positionRange =
+      percentile(positionValues, 0.95) - percentile(positionValues, 0.05);
+    const velocityRange =
+      percentile(velocityValues, 0.95) - percentile(velocityValues, 0.05);
+    const accRange =
+      percentile(accValues, 0.95) - percentile(accValues, 0.05);
+
+    const p95 = percentile(positionValues, 0.95);
+    const p05 = percentile(positionValues, 0.05);
+    const sign = Math.abs(p95) >= Math.abs(p05) ? 1 : -1;
+
+    return {
+      axis,
+      sign,
+      score:
+        Math.abs(positionRange) * 2.0 +
+        Math.abs(velocityRange) * 0.7 +
+        Math.abs(accRange) * 0.15,
+    };
+  });
+
+  return scores.sort((a, b) => b.score - a.score)[0] || {
+    axis: "z",
+    sign: 1,
+    score: 0,
+  };
+}
+
+function applyDeadband(value, deadband) {
+  if (!Number.isFinite(value)) return 0;
+  if (Math.abs(value) <= deadband) return 0;
+  return value - Math.sign(value) * deadband;
+}
+
+class Mahony6DofFilter {
+  constructor({
+    sampleIntervalSeconds = 0.02,
+    kp = 1.2,
+    ki = 0.0,
+    initialAcc = { x: 0, y: 0, z: 1 },
+  } = {}) {
+    this.sampleIntervalSeconds = sampleIntervalSeconds;
+    this.twoKp = 2 * kp;
+    this.twoKi = 2 * ki;
+
+    this.integralFBx = 0;
+    this.integralFBy = 0;
+    this.integralFBz = 0;
+
+    const initialQuaternion = quaternionFromAccel(initialAcc);
+
+    this.q0 = initialQuaternion.w;
+    this.q1 = initialQuaternion.x;
+    this.q2 = initialQuaternion.y;
+    this.q3 = initialQuaternion.z;
+  }
+
+  update({
+    gxDps,
+    gyDps,
+    gzDps,
+    ax,
+    ay,
+    az,
+    dt = this.sampleIntervalSeconds,
+  }) {
+    let gx = degToRad(gxDps);
+    let gy = degToRad(gyDps);
+    let gz = degToRad(gzDps);
+
+    let norm = Math.hypot(ax, ay, az);
+
+    if (norm > 0.0001) {
+      ax /= norm;
+      ay /= norm;
+      az /= norm;
+
+      const halfvx = this.q1 * this.q3 - this.q0 * this.q2;
+      const halfvy = this.q0 * this.q1 + this.q2 * this.q3;
+      const halfvz = this.q0 * this.q0 - 0.5 + this.q3 * this.q3;
+
+      const halfex = ay * halfvz - az * halfvy;
+      const halfey = az * halfvx - ax * halfvz;
+      const halfez = ax * halfvy - ay * halfvx;
+
+      if (this.twoKi > 0) {
+        this.integralFBx += this.twoKi * halfex * dt;
+        this.integralFBy += this.twoKi * halfey * dt;
+        this.integralFBz += this.twoKi * halfez * dt;
+
+        gx += this.integralFBx;
+        gy += this.integralFBy;
+        gz += this.integralFBz;
+      } else {
+        this.integralFBx = 0;
+        this.integralFBy = 0;
+        this.integralFBz = 0;
+      }
+
+      gx += this.twoKp * halfex;
+      gy += this.twoKp * halfey;
+      gz += this.twoKp * halfez;
+    }
+
+    gx *= 0.5 * dt;
+    gy *= 0.5 * dt;
+    gz *= 0.5 * dt;
+
+    const qa = this.q0;
+    const qb = this.q1;
+    const qc = this.q2;
+    const qd = this.q3;
+
+    this.q0 += -qb * gx - qc * gy - qd * gz;
+    this.q1 += qa * gx + qc * gz - qd * gy;
+    this.q2 += qa * gy - qb * gz + qd * gx;
+    this.q3 += qa * gz + qb * gy - qc * gx;
+
+    this.normalize();
+  }
+
+  normalize() {
+    const norm = Math.hypot(this.q0, this.q1, this.q2, this.q3) || 1;
+
+    this.q0 /= norm;
+    this.q1 /= norm;
+    this.q2 /= norm;
+    this.q3 /= norm;
+  }
+
+  getGravityVectorSensorFrame(magnitude = 1) {
+    return {
+      x: 2 * (this.q1 * this.q3 - this.q0 * this.q2) * magnitude,
+      y: 2 * (this.q0 * this.q1 + this.q2 * this.q3) * magnitude,
+      z:
+        (this.q0 * this.q0 -
+          this.q1 * this.q1 -
+          this.q2 * this.q2 +
+          this.q3 * this.q3) *
+        magnitude,
+    };
+  }
+
+  rotateSensorVectorToWorld(vector) {
+    return rotateVectorByQuaternion(vector, {
+      w: this.q0,
+      x: this.q1,
+      y: this.q2,
+      z: this.q3,
+    });
+  }
+}
+
+function quaternionFromAccel(acc) {
+  const ax = Number(acc.x) || 0;
+  const ay = Number(acc.y) || 0;
+  const az = Number(acc.z) || 1;
+
+  const roll = Math.atan2(ay, az);
+  const pitch = Math.atan2(-ax, Math.sqrt(ay * ay + az * az));
+  const yaw = 0;
+
+  return quaternionFromEuler(roll, pitch, yaw);
+}
+
+function quaternionFromEuler(roll, pitch, yaw) {
+  const cr = Math.cos(roll * 0.5);
+  const sr = Math.sin(roll * 0.5);
+  const cp = Math.cos(pitch * 0.5);
+  const sp = Math.sin(pitch * 0.5);
+  const cy = Math.cos(yaw * 0.5);
+  const sy = Math.sin(yaw * 0.5);
+
+  return {
+    w: cr * cp * cy + sr * sp * sy,
+    x: sr * cp * cy - cr * sp * sy,
+    y: cr * sp * cy + sr * cp * sy,
+    z: cr * cp * sy - sr * sp * cy,
+  };
+}
+
+function rotateVectorByQuaternion(vector, q) {
+  const vx = vector.x;
+  const vy = vector.y;
+  const vz = vector.z;
+
+  const qw = q.w;
+  const qx = q.x;
+  const qy = q.y;
+  const qz = q.z;
+
+  const ix = qw * vx + qy * vz - qz * vy;
+  const iy = qw * vy + qz * vx - qx * vz;
+  const iz = qw * vz + qx * vy - qy * vx;
+  const iw = -qx * vx - qy * vy - qz * vz;
+
+  return {
+    x: ix * qw + iw * -qx + iy * -qz - iz * -qy,
+    y: iy * qw + iw * -qy + iz * -qx - ix * -qz,
+    z: iz * qw + iw * -qz + ix * -qy - iy * -qx,
+  };
+}
+
+function degToRad(value) {
+  return ((Number(value) || 0) * Math.PI) / 180;
+}
+
+function safeClamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function buildGithubInspiredKinematics(samples, calibrationProfile = null) {
+  const timestamps = samples.map((sample) => sample.timestamp);
+  const intervalMs = estimateIntervalFromTimestamps(timestamps) || 20;
+  const calibrationBias = calibrationProfile?.bias || {};
+
+  let smoothAy = Number.isFinite(Number(calibrationBias.ay))
+    ? Number(calibrationBias.ay)
+    : samples[0].ay;
+
+  let smoothAz = Number.isFinite(Number(calibrationBias.az))
+    ? Number(calibrationBias.az)
+    : samples[0].az;
+
+  let smoothGx = Number.isFinite(Number(calibrationBias.gx))
+    ? Number(calibrationBias.gx)
+    : samples[0].gx;
+
+  const gyroBiasX = Number.isFinite(Number(calibrationBias.gx))
+    ? Number(calibrationBias.gx)
+    : 0;
+
+  let angleXDeg = 0;
+  let speedY = 0;
+  let distanceY = 0;
+
+  const linearY = [];
+  const speed = [];
+  const distance = [];
+  const angle = [];
+
+  for (let index = 0; index < samples.length; index += 1) {
+    const sample = samples[index];
+    const previous = samples[Math.max(0, index - 1)];
+
+    const dt =
+      index === 0
+        ? intervalMs / 1000
+        : Math.max((sample.timestamp - previous.timestamp) / 1000, 0.001);
+
+    smoothAy = smoothAy * 0.99 + sample.ay * 0.01;
+    smoothAz = smoothAz * 0.99 + sample.az * 0.01;
+    smoothGx = smoothGx * 0.99 + sample.gx * 0.01;
+
+    angleXDeg += (smoothGx - gyroBiasX) * dt;
+
+    const zGravity = safeClamp(smoothAz, -1, 1);
+    const yGravityMagnitude = Math.sqrt(Math.max(0, 1 - zGravity * zGravity));
+
+    let realAccelY =
+      angleXDeg > 0
+        ? smoothAy - yGravityMagnitude
+        : smoothAy + yGravityMagnitude;
+
+    if (Math.abs(realAccelY) < 0.15) {
+      realAccelY = 0;
+    }
+
+    speedY += realAccelY * dt;
+    distanceY += speedY * dt;
+
+    linearY.push(realAccelY);
+    speed.push(speedY);
+    distance.push(distanceY);
+    angle.push(angleXDeg);
+  }
+
+  const baselineCount = Math.max(5, Math.round(700 / intervalMs));
+  const baseline = percentile(distance.slice(0, baselineCount), 0.5);
+  const positionProxy = distance.map((value) => value - baseline);
+
+  return {
+    method: "github_inspired_y_axis",
+    linearAccProxy: linearY,
+    velocityProxy: speed,
+    positionProxy,
+    angleXDeg: angle,
+  };
+}
+
+function detectWeightStackRepsFromKinematics(kinematics, timestamps) {
+  if (!kinematics?.positionProxy?.length || !Array.isArray(timestamps)) {
+    return [];
+  }
+
+  const position = kinematics.positionProxy;
+  const velocity = kinematics.velocityProxy || new Array(position.length).fill(0);
+
+  if (position.length !== timestamps.length) return [];
+
+  const p05 = percentile(position, 0.05);
+  const p95 = percentile(position, 0.95);
+  const range = p95 - p05;
+
+  if (!Number.isFinite(range) || Math.abs(range) < 0.0008) {
+    const github = kinematics.fallbackGithub;
+
+    if (github?.positionProxy?.length === timestamps.length) {
+      return detectWeightStackRepsFromPositionAndVelocity(
+        github.positionProxy,
+        github.velocityProxy,
+        timestamps,
+        "github_fallback_position"
+      );
+    }
+
+    return [];
+  }
+
+  const markers = detectWeightStackRepsFromPositionAndVelocity(
+    position,
+    velocity,
+    timestamps,
+    "mahony_position_proxy"
+  );
+
+  if (
+    markers.length === 0 &&
+    kinematics.fallbackGithub?.positionProxy?.length === timestamps.length
+  ) {
+    const fallbackMarkers = detectWeightStackRepsFromPositionAndVelocity(
+      kinematics.fallbackGithub.positionProxy,
+      kinematics.fallbackGithub.velocityProxy,
+      timestamps,
+      "github_fallback_position"
+    );
+
+    if (fallbackMarkers.length > 0) return fallbackMarkers;
+  }
+
+  return markers;
+}
+
+function detectWeightStackRepsFromPositionAndVelocity(
+  positionInput,
+  velocityInput,
+  timestamps,
+  method = "position_velocity_proxy"
+) {
+  if (!positionInput.length || positionInput.length !== timestamps.length) {
+    return [];
+  }
+
+  const intervalMs = estimateIntervalFromTimestamps(timestamps) || 20;
+
+  let position = movingAverage(
+    positionInput,
+    Math.max(3, Math.round(90 / intervalMs))
+  );
+
+  let velocity = movingAverage(
+    velocityInput,
+    Math.max(3, Math.round(70 / intervalMs))
+  );
+
+  const initialCount = Math.max(
+    8,
+    Math.min(position.length, Math.round(700 / intervalMs))
+  );
+
+  const startLevel = percentile(position.slice(0, initialCount), 0.5);
+  position = position.map((value) => value - startLevel);
+
+  const p05 = percentile(position, 0.05);
+  const p95 = percentile(position, 0.95);
+
+  if (Math.abs(p05) > Math.abs(p95)) {
+    position = position.map((value) => -value);
+    velocity = velocity.map((value) => -value);
+  }
+
+  const low = percentile(position, 0.05);
+  const high = percentile(position, 0.95);
+  const range = high - low;
+
+  if (!Number.isFinite(range) || range < 0.0008) return [];
+
+  const startThreshold = Math.max(range * 0.2, 0.00045);
+  const endThreshold = Math.max(range * 0.13, 0.00025);
+  const validRomThreshold = Math.max(range * 0.34, 0.0007);
+
+  const minRepDurationMs = 700;
+  const maxRepDurationMs = 10000;
+  const minSamples = 15;
+
+  const startHoldSamples = Math.max(2, Math.round(100 / intervalMs));
+  const endHoldSamples = Math.max(4, Math.round(260 / intervalMs));
+  const refractoryMs = 250;
+
+  const correctionDropThreshold = range * 0.14;
+  const correctionRecoverThreshold = range * 0.07;
+
+  const markers = [];
+
+  let state = "idle";
+
+  let startIndex = 0;
+  let peakIndex = 0;
+  let maxPosition = -Infinity;
+
+  let aboveStartCount = 0;
+  let belowEndCount = 0;
+  let lastRepEndTimestamp = -Infinity;
+
+  let correctionCount = 0;
+  let correctionArmed = false;
+  let firstAttemptRomProxy = null;
+
+  function reset() {
+    state = "idle";
+    startIndex = 0;
+    peakIndex = 0;
+    maxPosition = -Infinity;
+    aboveStartCount = 0;
+    belowEndCount = 0;
+    correctionCount = 0;
+    correctionArmed = false;
+    firstAttemptRomProxy = null;
+  }
+
+  function findStartIndex(index) {
+    const backSamples = Math.max(3, Math.round(500 / intervalMs));
+
+    for (let i = index; i >= Math.max(0, index - backSamples); i -= 1) {
+      if (position[i] <= endThreshold) return i;
+    }
+
+    return Math.max(0, index - Math.round(150 / intervalMs));
+  }
+
+  function finishRep(endIndex, forced = false) {
+    const durationMs = timestamps[endIndex] - timestamps[startIndex];
+    const sampleCount = endIndex - startIndex + 1;
+
+    const valid =
+      durationMs >= minRepDurationMs &&
+      durationMs <= maxRepDurationMs &&
+      sampleCount >= minSamples &&
+      maxPosition >= validRomThreshold;
+
+    if (valid) {
+      markers.push({
+        startIndex,
+        peakIndex,
+        endIndex,
+        direction: 1,
+        amplitudeProxy: maxPosition,
+        maxRomProxy: maxPosition,
+        firstAttemptRomProxy: firstAttemptRomProxy ?? maxPosition,
+        correctionDetected: correctionCount > 0,
+        correctionCount,
+        durationMs,
+        completed: true,
+        forced,
+        detectionMethod: method,
+      });
+
+      lastRepEndTimestamp = timestamps[endIndex];
+    }
+
+    reset();
+  }
+
+  for (let index = 0; index < position.length; index += 1) {
+    const pos = position[index];
+    const timestamp = timestamps[index];
+
+    if (state === "idle") {
+      if (timestamp - lastRepEndTimestamp < refractoryMs) continue;
+
+      if (pos >= startThreshold) {
+        aboveStartCount += 1;
+      } else {
+        aboveStartCount = 0;
+      }
+
+      if (aboveStartCount >= startHoldSamples) {
+        state = "active";
+        startIndex = findStartIndex(index);
+        peakIndex = index;
+        maxPosition = pos;
+        belowEndCount = 0;
+        correctionCount = 0;
+        correctionArmed = false;
+        firstAttemptRomProxy = null;
+      }
+
+      continue;
+    }
+
+    const durationMs = timestamp - timestamps[startIndex];
+
+    if (pos > maxPosition) {
+      if (
+        correctionArmed &&
+        pos >= maxPosition + correctionRecoverThreshold &&
+        maxPosition >= validRomThreshold * 0.45
+      ) {
+        correctionCount += 1;
+        correctionArmed = false;
+      }
+
+      maxPosition = pos;
+      peakIndex = index;
+    }
+
+    if (
+      firstAttemptRomProxy === null &&
+      maxPosition >= validRomThreshold * 0.45 &&
+      pos <= maxPosition - correctionDropThreshold &&
+      pos > endThreshold
+    ) {
+      firstAttemptRomProxy = maxPosition;
+      correctionArmed = true;
+    }
+
+    if (pos <= endThreshold && maxPosition >= validRomThreshold) {
+      belowEndCount += 1;
+    } else {
+      belowEndCount = 0;
+    }
+
+    if (belowEndCount >= endHoldSamples && durationMs >= minRepDurationMs) {
+      const endIndex = Math.max(startIndex, index - belowEndCount + 1);
+      finishRep(endIndex, false);
+      continue;
+    }
+
+    if (durationMs > maxRepDurationMs && maxPosition >= validRomThreshold) {
+      finishRep(index, true);
+    }
+  }
+
+  return markers;
+}
+
+function detectWeightStackRepsLegacy(rawSignal, timestamps) {
+  if (!rawSignal.length || rawSignal.length !== timestamps.length) return [];
+
+  const intervalMs = estimateIntervalFromTimestamps(timestamps);
+  const filtered = lowPassFilter(rawSignal, 0.15);
+  const baselineWindow = Math.max(9, Math.round(1200 / intervalMs));
+  const baseline = movingAverage(filtered, baselineWindow);
+  const centered = filtered.map((value, index) => value - baseline[index]);
+  const absSignal = movingAverage(
+    centered.map(Math.abs),
+    Math.max(3, Math.round(120 / intervalMs))
+  );
+
+  const threshold = Math.max(0.04, standardDeviation(centered) * 0.45);
+  const minimumAboveMs = 120;
+  const minimumBelowMs = 200;
+  const minimumRepDurationMs = 700;
+  const maximumRepDurationMs = 6000;
+  const minimumSamples = 15;
+  const refractoryMs = 250;
+  const minimumAmplitude = Math.max(0.045, threshold * 1.4);
+
+  const markers = [];
+
+  let state = "rest";
+  let aboveStartIndex = null;
+  let startIndex = 0;
+  let peakIndex = 0;
+  let peakAbs = 0;
+  let lastActiveIndex = 0;
+  let lastRepEndTimestamp = -Infinity;
+
+  for (let index = 0; index < absSignal.length; index += 1) {
+    const timestamp = timestamps[index];
+    const value = absSignal[index];
+
+    if (state === "rest") {
+      if (timestamp - lastRepEndTimestamp < refractoryMs) continue;
+
+      if (value >= threshold) {
+        if (aboveStartIndex === null) aboveStartIndex = index;
+
+        state = "moving";
+        startIndex = Math.max(
+          0,
+          aboveStartIndex - Math.max(1, Math.round(minimumAboveMs / intervalMs))
+        );
+
+        peakIndex = index;
+        peakAbs = value;
+        lastActiveIndex = index;
+      } else if (value < threshold * 0.8) {
+        aboveStartIndex = null;
+      }
+
+      continue;
+    }
+
+    if (value > peakAbs) {
+      peakAbs = value;
+      peakIndex = index;
+    }
+
+    if (value >= threshold) {
+      lastActiveIndex = index;
+    }
+
+    if (timestamp - timestamps[lastActiveIndex] >= minimumBelowMs) {
+      const endIndex = Math.min(
+        index,
+        lastActiveIndex + Math.max(1, Math.round(minimumBelowMs / intervalMs))
+      );
+
+      const durationMs = timestamps[endIndex] - timestamps[startIndex];
+      const sampleCount = endIndex - startIndex + 1;
+      const amplitudeProxy = percentile(
+        absSignal.slice(startIndex, endIndex + 1),
+        0.95
+      );
+
+      const hasRealMovement =
+        durationMs >= minimumRepDurationMs &&
+        durationMs <= maximumRepDurationMs &&
+        sampleCount >= minimumSamples &&
+        amplitudeProxy >= minimumAmplitude;
+
+      if (hasRealMovement) {
+        markers.push({
+          startIndex,
+          peakIndex,
+          endIndex,
+          direction: Math.sign(centered[peakIndex]) || 1,
+          amplitudeProxy,
+          detectionMethod: "legacy_activity",
+        });
+
+        lastRepEndTimestamp = timestamps[endIndex];
+      }
+
+      state = "rest";
+      aboveStartIndex = null;
+      peakAbs = 0;
+    }
+  }
+
+  return markers;
+}
+
 function detectRepsCycleBased(signal, timestamps, options = {}) {
   if (!signal.length) return [];
   const minimumRepDurationMs = options.minimumRepDurationMs || 700;
@@ -1368,15 +3125,23 @@ function segmentReps(inputSamples, repMarkers) {
       startTimestamp: inputSamples[startIndex]?.timestamp || 0,
       peakTimestamp: inputSamples[peakIndex]?.timestamp || 0,
       endTimestamp: inputSamples[endIndex]?.timestamp || 0,
+      marker,
     };
   });
 }
 
 function calculateRepMetrics(repSegments, mode) {
   return repSegments.map((segment, index) => {
-    const amplitudeProxy = Math.max(0, percentile(segment.primary, 0.95) - percentile(segment.primary, 0.05));
-    const durationMs = Math.max(0, segment.endTimestamp - segment.startTimestamp);
-    const velocityProxy = amplitudeProxy / Math.max(durationMs / 1000, 0.001);
+    const marker = segment.marker || {};
+    const amplitudeProxy = Number.isFinite(Number(marker.amplitude))
+      ? Number(marker.amplitude)
+      : Math.max(0, percentile(segment.primary, 0.95) - percentile(segment.primary, 0.05));
+    const durationMs = Number.isFinite(Number(marker.durationMs))
+      ? Number(marker.durationMs)
+      : Math.max(0, segment.endTimestamp - segment.startTimestamp);
+    const velocityProxy = Number.isFinite(Number(marker.meanVelocity))
+      ? Number(marker.meanVelocity)
+      : amplitudeProxy / Math.max(durationMs / 1000, 0.001);
     const highFrequencyRms = rms(segment.highFrequency);
     const jerkRms = rms(segment.jerk);
     const tremorScore = highFrequencyRms + jerkRms * 0.015;
@@ -1398,9 +3163,10 @@ function calculateRepMetrics(repSegments, mode) {
       peakValue: segment.primary.length ? Math.max(...segment.primary.map(Math.abs)) : 0,
       amplitudeProxy,
       ROMProxy: amplitudeProxy,
+      romRatio: Number.isFinite(Number(marker.romRatio)) ? Number(marker.romRatio) : null,
       romRelativeToReference: null,
       velocityProxy,
-      velocityLossPercent: 0,
+      velocityLossPercent: Number.isFinite(Number(marker.velocityLoss)) ? Math.round(Number(marker.velocityLoss) * 100) : 0,
       smoothnessScore,
       jerkScore: jerkRms,
       tremorScore,
@@ -1411,6 +3177,14 @@ function calculateRepMetrics(repSegments, mode) {
       curveSimilarity: null,
       qualityClass: "uncertain",
       qualityReasons: [],
+      qualityFlags: marker.qualityFlags || {},
+      upMs: marker.upMs || 0,
+      downMs: marker.downMs || 0,
+      topPauseMs: marker.topPauseMs || 0,
+      bottomPauseMs: marker.bottomPauseMs || 0,
+      peakVelocity: marker.peakVelocity || 0,
+      meanVelocity: marker.meanVelocity || velocityProxy,
+      jerkRms: marker.jerkRms || jerkRms,
       leftRightImbalanceProxy: mode === "barbell" ? maxTiltProxy : null,
       wobbleScore: mode === "barbell" ? 100 - barTiltScore : 100 - gyroStabilityScore,
     };
@@ -1434,7 +3208,7 @@ function validateSampleRate(inputSamples, mode = "free_movement") {
   );
   const issues = [];
   if (inputSamples.length < MIN_ANALYSIS_SAMPLES) issues.push("Zu wenige Samples");
-  if (sampleRateHz && (sampleRateHz < 35 || sampleRateHz > 70)) issues.push("Datenrate außerhalb des erwarteten 50-Hz-Bereichs");
+  if (sampleRateHz && (sampleRateHz < 18 || sampleRateHz > 80)) issues.push("Datenrate außerhalb des erwarteten Bereichs");
   if (jitterRatio > 0.22) issues.push("Datenrate schwankt deutlich");
   if (accSpread < 0.025) issues.push("Bewegungssignal sehr klein");
   if (mode === "weight_stack" && percentile(gyroValues, 0.9) > 35) issues.push("Gyro beim Gewichtsblock ungewöhnlich hoch");
@@ -1473,7 +3247,74 @@ function applyRomRelativeToReference(repMetrics, referenceRepMetrics = []) {
   const referenceRom = average(referenceRepMetrics.map((rep) => rep.amplitudeProxy).filter(Boolean));
   repMetrics.forEach((rep) => {
     rep.romRelativeToReference = referenceRom ? clamp((rep.amplitudeProxy / referenceRom) * 100, 0, 200) : null;
+    rep.romPercent = rep.romRelativeToReference;
   });
+}
+
+function tremorLevelFromScore(score) {
+  if (!Number.isFinite(Number(score))) return "medium";
+  if (score > 2.2) return "high";
+  if (score > 1.1) return "medium";
+  return "low";
+}
+
+function applyRepFeedback(repMetrics, fatigue = {}, mode = "free_movement") {
+  repMetrics.forEach((rep) => {
+    rep.romPercent = Number.isFinite(rep.romRelativeToReference) ? Math.round(rep.romRelativeToReference) : null;
+    rep.tremorLevel = tremorLevelFromScore(rep.tremorScore);
+    rep.fatigueFlag = Boolean(fatigue.fatigueDetected && rep.repNumber >= fatigue.fatigueStartRep);
+    const reasons = new Set(rep.qualityReasons || []);
+    if (rep.fatigueFlag) reasons.add("Tempo fällt ab");
+    if (rep.romPercent !== null && rep.romPercent < 85) reasons.add("ROM verkürzt");
+    if (rep.tremorLevel === "high") reasons.add("Ruckeln erhöht");
+
+    if (rep.qualityClass === "clean" && !rep.fatigueFlag) {
+      rep.feedbackText = "Sauber";
+    } else if (reasons.has("ROM verkürzt") || reasons.has("ROM")) {
+      rep.feedbackText = "ROM verkürzt";
+    } else if (reasons.has("Tempo") || reasons.has("Tempo fällt ab")) {
+      rep.feedbackText = "Tempo fällt ab";
+    } else if (reasons.has("Ruckeln") || reasons.has("Ruckeln erhöht")) {
+      rep.feedbackText = "Ruckeln erhöht";
+    } else if (mode === "weight_stack" && reasons.has("Messung unsicher")) {
+      rep.feedbackText = "Messung unsicher";
+    } else {
+      rep.feedbackText = rep.qualityClass === "bad" ? "Ausführung unsauber" : "Grenzwertig";
+    }
+    rep.audioCue = buildAudioCueForRep(rep, { fatigue });
+  });
+}
+
+function calculateWeightStackScore({ repMetrics, referenceRepMetrics = [], tempoConsistencyScore = 0, tremorScore = 0 }) {
+  if (!repMetrics.length) return 0;
+  const referenceRom = average(referenceRepMetrics.map((rep) => rep.amplitudeProxy).filter(Boolean));
+  const referenceDuration = average(referenceRepMetrics.map((rep) => rep.durationMs).filter(Boolean));
+  const referenceVelocity = average(referenceRepMetrics.map((rep) => rep.velocityProxy).filter(Number.isFinite));
+  const referenceTremor = average(referenceRepMetrics.map((rep) => rep.tremorScore).filter(Number.isFinite));
+
+  const romScore = referenceRom
+    ? clamp(100 - Math.abs((average(repMetrics.map((rep) => rep.amplitudeProxy)) / referenceRom) * 100 - 100) * 2.2, 0, 100)
+    : clamp(100 - (standardDeviation(repMetrics.map((rep) => rep.amplitudeProxy)) / Math.max(average(repMetrics.map((rep) => rep.amplitudeProxy)), 0.001)) * 180, 0, 100);
+  const durationScore = referenceDuration
+    ? percentSimilarity(average(repMetrics.map((rep) => rep.durationMs)), referenceDuration)
+    : tempoConsistencyScore;
+  const velocityScore = referenceVelocity
+    ? percentSimilarity(average(repMetrics.map((rep) => rep.velocityProxy)), referenceVelocity)
+    : clamp(100 - Math.max(0, ...repMetrics.map((rep) => rep.velocityLossPercent || 0)) * 2, 0, 100);
+  const tempoVelocityScore = clamp(durationScore * 0.45 + velocityScore * 0.55, 0, 100);
+  const tremorScorePart = referenceTremor
+    ? clamp(100 - Math.max(0, percentDifference(tremorScore, referenceTremor)) * 1.8, 0, 100)
+    : clamp(100 - tremorScore * 20, 0, 100);
+  const repConsistencyScore = clamp(tempoConsistencyScore * 0.65 + romScore * 0.35, 0, 100);
+
+  return Math.round(clamp(
+    romScore * 0.4 +
+    tempoVelocityScore * 0.25 +
+    tremorScorePart * 0.2 +
+    repConsistencyScore * 0.15,
+    0,
+    100,
+  ));
 }
 
 function classifyCleanReps(repMetrics, referenceMetrics = [], mode = "free_movement", sensorQuality = { status: "good" }) {
@@ -1515,7 +3356,7 @@ function classifyCleanReps(repMetrics, referenceMetrics = [], mode = "free_movem
     if (basis.duration && (rep.durationMs > basis.duration * 1.2 || rep.velocityLossPercent > 20)) reasons.push("Tempo");
     if (basis.tremor && rep.tremorScore > basis.tremor * 1.3) reasons.push("Ruckeln");
     if (basis.smoothness && rep.smoothnessScore < basis.smoothness * 0.8) reasons.push("Smoothness");
-    if (basis.stability && rep.gyroStabilityScore < basis.stability * (mode === "weight_stack" ? 0.65 : 0.7)) reasons.push("Stabilität");
+    if (mode !== "weight_stack" && basis.stability && rep.gyroStabilityScore < basis.stability * 0.7) reasons.push("Stabilität");
     if (sensorQuality.status !== "good") reasons.push("Messung unsicher");
 
     if (sensorQuality.status !== "good" && reasons.length <= 1) rep.qualityClass = "uncertain";
@@ -1532,7 +3373,7 @@ function classifyCleanReps(repMetrics, referenceMetrics = [], mode = "free_movem
   return { ...counts, firstBadRep, mainIssue, velocityLossPercent };
 }
 
-function detectFatigue(repMetrics, referenceRepMetrics = []) {
+function detectFatigue(repMetrics, referenceRepMetrics = [], mode = "free_movement") {
   const result = { fatigueDetected: false, fatigueStartRep: null, fatigueReasons: [], fatigueScore: 0 };
   if (!repMetrics.length) return result;
   const baselineReps = repMetrics.slice(0, Math.min(3, repMetrics.length));
@@ -1552,7 +3393,7 @@ function detectFatigue(repMetrics, referenceRepMetrics = []) {
     if (baseline.amplitudeProxy && rep.amplitudeProxy < baseline.amplitudeProxy * 0.85) reasons.push("Amplitude/ROMProxy sinkt");
     if (baseline.tremorScore && rep.tremorScore > baseline.tremorScore * 1.3) reasons.push("Tremor/Ruckeln steigt");
     if (baseline.smoothnessScore && rep.smoothnessScore < baseline.smoothnessScore * 0.8) reasons.push("Smoothness sinkt");
-    if (baseline.gyroStabilityScore && rep.gyroStabilityScore < baseline.gyroStabilityScore * 0.7) reasons.push("Gyro-Stabilität verschlechtert sich");
+    if (mode !== "weight_stack" && baseline.gyroStabilityScore && rep.gyroStabilityScore < baseline.gyroStabilityScore * 0.7) reasons.push("Gyro-Stabilität verschlechtert sich");
     if (baseline.velocityProxy && rep.velocityProxy < baseline.velocityProxy * 0.8) reasons.push("VelocityProxy sinkt");
     if (reasons.length >= 2) {
       return {
@@ -1589,6 +3430,22 @@ function compareToReferenceByMode(currentRecording, referenceRecording, exercise
     stability: percentSimilarity(currentMetrics.stabilityScore, referenceMetrics.stabilityScore),
     tremor: percentSimilarity(currentMetrics.tremorScore, referenceMetrics.tremorScore),
   };
+  let overallScore;
+  if (mode === "weight_stack") {
+    const romScore = scores.amplitude;
+    const velocityScore = clamp(100 - Math.max(0, currentMetrics.velocityLossPercent || 0) * 2, 0, 100);
+    const tempoVelocityScore = clamp(scores.duration * 0.45 + velocityScore * 0.55, 0, 100);
+    const tremorScorePart = clamp(100 - Math.max(0, comparisonSafePercentDifference(currentMetrics.tremorScore, referenceMetrics.tremorScore)) * 1.8, 0, 100);
+    const repConsistencyScore = clamp(scores.rep * 0.35 + currentMetrics.tempoConsistencyScore * 0.4 + scores.amplitude * 0.25, 0, 100);
+    overallScore = Math.round(clamp(
+      romScore * 0.4 +
+      tempoVelocityScore * 0.25 +
+      tremorScorePart * 0.2 +
+      repConsistencyScore * 0.15,
+      0,
+      100,
+    ));
+  } else {
   const weights = {
     weight_stack: [0.38, 0.06, 0.12, 0.14, 0.14, 0.1, 0.03, 0.03],
     barbell: [0.24, 0.22, 0.1, 0.12, 0.12, 0.07, 0.1, 0.03],
@@ -1596,7 +3453,8 @@ function compareToReferenceByMode(currentRecording, referenceRecording, exercise
     free_movement: [0.3, 0.12, 0.12, 0.14, 0.12, 0.1, 0.05, 0.05],
     body_segment: [0.3, 0.12, 0.12, 0.14, 0.12, 0.1, 0.05, 0.05],
   }[mode] || [0.3, 0.12, 0.12, 0.14, 0.12, 0.1, 0.05, 0.05];
-  let overallScore = Math.round(primaryCurveScore * weights[0] + secondaryCurveScore * weights[1] + scores.rep * weights[2] + scores.duration * weights[3] + scores.amplitude * weights[4] + scores.smoothness * weights[5] + scores.stability * weights[6] + scores.tremor * weights[7]);
+  overallScore = Math.round(primaryCurveScore * weights[0] + secondaryCurveScore * weights[1] + scores.rep * weights[2] + scores.duration * weights[3] + scores.amplitude * weights[4] + scores.smoothness * weights[5] + scores.stability * weights[6] + scores.tremor * weights[7]);
+  }
   if (tooLittleData) overallScore = Math.min(overallScore, 35);
   const comparison = {
     overallScore,
@@ -1631,9 +3489,11 @@ function buildFeedbackMessages(analysis, comparison, exercise = getSelectedExerc
   if (comparison.amplitudeDiffPercent < -15) messages.push("Range of Motion wirkt verkürzt im Vergleich zur Referenz.");
   else if (comparison.relativeRangeOfMotion !== null && comparison.relativeRangeOfMotion >= 90 && comparison.relativeRangeOfMotion <= 110) messages.push("Bewegungsumfang ähnlich zur Referenz.");
   if (comparison.smoothnessDiffPercent < -20) messages.push("Bewegung ist ruckartiger als in der Referenz.");
-  if (comparison.tremorDiffPercent > 30) messages.push("Zunehmendes Ruckeln/Zittern erkannt. Hinweis auf zunehmende muskuläre Ermüdung oder instabilere Bewegung.");
+  if (comparison.tremorDiffPercent > 30) messages.push("Ruckeln/Zittern im Bewegungssignal nimmt zu.");
   if (analysis.fatigue?.fatigueDetected) messages.push(`Saubere Bewegung bis Rep ${Math.max(1, analysis.fatigue.fatigueStartRep - 1)}, danach zunehmende Ermüdung.`);
-  if (mode === "weight_stack" && comparison.stabilityDiffPercent < -30) messages.push("Hohe Rotationsanteile: Sensor könnte verrutschen oder der Block verkantet/ruckelt.");
+  if (mode === "weight_stack" && analysis.sensorQuality?.issues?.some((issue) => issue.includes("Gyro"))) {
+    messages.push("Sensor sitzt möglicherweise locker / Messung unsicher.");
+  }
   if (mode === "barbell" && comparison.stabilityDiffPercent < -20) messages.push("Stangenrotation höher als in der Referenz. Möglicher Hinweis auf asymmetrische Belastung.");
   if (mode === "cable_handle" && comparison.stabilityDiffPercent < -20) messages.push("Griffrotation höher als Referenz.");
   if (mode === "body_segment") messages.push("Körpersegment-Modus ist als Future Mode sichtbar, aber noch generisch ausgewertet.");
@@ -1717,13 +3577,133 @@ function buildFeedbackEvents(analysis, comparison = null) {
     if (baselineTremor && rep.tremorScore > baselineTremor * 1.3) events.push({ type: "tremor_high", rep: rep.repNumber });
     if (rep.maxTiltProxy > 45) events.push({ type: "bar_tilt", rep: rep.repNumber });
   });
-  if (analysis.sensorQuality?.status !== "good") events.push({ type: "sensor_unstable", rep: null });
+  if (analysis.sensorQuality?.status !== "good") events.push({ type: "sensor_uncertain", rep: null });
   if (comparison?.relativeRangeOfMotion && comparison.relativeRangeOfMotion < 85) events.push({ type: "rom_low", rep: null });
   return events;
 }
 
 function buildMetricEvents(repMetrics, fatigue, mode) {
   return buildFeedbackEvents({ repMetrics, fatigue, analysisMode: mode }, null);
+}
+
+function speakFeedback(text) {
+  if (!audioFeedbackEnabled || !text || !("speechSynthesis" in window)) return;
+  const now = Date.now();
+  const delay = Math.max(0, audioCooldownMs - (now - lastAudioAt));
+  window.setTimeout(() => {
+    try {
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.lang = "de-DE";
+      utterance.rate = 1.02;
+      utterance.pitch = 0.92;
+      speechSynthesis.speak(utterance);
+      lastAudioAt = Date.now();
+    } catch (error) {
+      console.warn("Audiofeedback konnte nicht gesprochen werden.", error);
+    }
+  }, delay);
+}
+
+function queueAudioCue(event) {
+  if (!audioFeedbackEnabled || !event?.message || !("speechSynthesis" in window)) return;
+  if (recordingMode === "reference" && event.type !== "reference_end") return;
+  const limit = event.type === "set_summary" ? 1 : 2;
+  const currentCount = audioEventCounts[event.type] || 0;
+  if (currentCount >= limit) return;
+  audioEventCounts[event.type] = currentCount + 1;
+  audioQueue.push({
+    type: event.type,
+    repIndex: event.repIndex ?? null,
+    message: event.message,
+    priority: event.priority ?? 5,
+    spoken: false,
+  });
+  audioQueue.sort((a, b) => (b.priority || 0) - (a.priority || 0));
+  processAudioQueue();
+}
+
+function processAudioQueue() {
+  if (audioProcessing || !audioFeedbackEnabled || !audioQueue.length) return;
+  const next = audioQueue.shift();
+  if (!next || next.spoken) return;
+  audioProcessing = true;
+  speakFeedback(next.message);
+  next.spoken = true;
+  window.setTimeout(() => {
+    audioProcessing = false;
+    processAudioQueue();
+  }, audioCooldownMs);
+}
+
+function buildAudioCueForRep(repMetric, analysis = {}) {
+  if (!repMetric) return null;
+  if (analysis.fatigue?.fatigueDetected && repMetric.repNumber === analysis.fatigue.fatigueStartRep) {
+    return {
+      type: "fatigue_start",
+      repIndex: repMetric.repNumber,
+      message: `Ermüdung ab Wiederholung ${repMetric.repNumber}`,
+      priority: 9,
+    };
+  }
+  if (repMetric.romPercent !== null && repMetric.romPercent < 85) {
+    return {
+      type: "rom_low",
+      repIndex: repMetric.repNumber,
+      message: "Bewegungsumfang wird kürzer",
+      priority: 8,
+    };
+  }
+  if ((repMetric.velocityLossPercent || 0) > 25 || repMetric.durationMs > 0 && repMetric.feedbackText === "Tempo fällt ab") {
+    return {
+      type: "tempo_loss",
+      repIndex: repMetric.repNumber,
+      message: "Tempo kontrollieren",
+      priority: 7,
+    };
+  }
+  if (repMetric.tremorLevel === "high") {
+    return {
+      type: "tremor_high",
+      repIndex: repMetric.repNumber,
+      message: "Bewegung wird unruhig",
+      priority: 7,
+    };
+  }
+  if (repMetric.qualityClass === "bad") {
+    return {
+      type: "set_stop_suggestion",
+      repIndex: repMetric.repNumber,
+      message: "Satz besser beenden",
+      priority: 6,
+    };
+  }
+  return null;
+}
+
+function buildSetSummaryAudio(analysis) {
+  if (!analysis) return "";
+  const reps = analysis.reps || 0;
+  const clean = analysis.cleanRepCount || 0;
+  const recommendation = analysis.recommendation?.label || "Gewicht halten";
+  return `${reps} Wiederholungen erkannt, ${clean} sauber. Empfehlung: ${recommendation}.`;
+}
+
+function queueLiveRepAudio(analysis) {
+  if (!audioFeedbackEnabled || !recording || recordingMode !== "set") return;
+  if (analysis.sensorQuality?.issues?.some((issue) => issue.includes("Gyro"))) {
+    queueAudioCue({
+      type: "sensor_uncertain",
+      message: "Sensor sitzt möglicherweise locker, Messung unsicher",
+      priority: 8,
+    });
+  }
+  const repMetrics = analysis.repMetrics || [];
+  if (repMetrics.length <= lastAudioRepCount) return;
+  repMetrics.slice(lastAudioRepCount).forEach((rep) => {
+    const cue = buildAudioCueForRep(rep, analysis);
+    if (cue?.type !== "rep_clean_optional") queueAudioCue(cue);
+  });
+  lastAudioRepCount = repMetrics.length;
 }
 
 function normalizedCurveRmseValues(currentValues, referenceValues) {
@@ -2221,12 +4201,15 @@ function renderRecordingState() {
   elements.connectButton.disabled = recording;
   elements.demoButton.disabled = recording;
   elements.calibrateButton.disabled = recording || !sourceReady || !exercise || calibrationActive;
+  elements.audioFeedbackToggle.disabled = !("speechSynthesis" in window);
   elements.demoProfile.disabled = recording;
   elements.recordingExerciseSelect.disabled = recording || appState.exercises.length === 0;
   elements.recordingModeValue.textContent =
     recordingMode === "reference" ? "Referenz" :
       recordingMode === "set" ? "Trainingssatz" : "—";
   elements.analysisModeValue.textContent = exercise ? analysisModeLabel(exercise.analysisMode) : "—";
+  const isWeightStack = normalizeAnalysisMode(exercise?.analysisMode, exercise?.equipmentType) === "weight_stack";
+  if (elements.liveSecondaryChartCard) elements.liveSecondaryChartCard.hidden = isWeightStack;
   elements.sampleCount.textContent = liveAnalysis.dominantAxis || "—";
   elements.liveRepCount.textContent = String(liveAnalysis.reps || 0);
   updateLiveTrainingValues(liveAnalysis);
@@ -2269,21 +4252,23 @@ function renderRecordingPreview() {
       <span class="score ${scoreClass(score)}">${Math.round(score)} %</span>
     </div>
     ${renderAthleteSummary(metrics, pendingRecording.comparison, getSelectedExercise())}
-    <div class="result-grid">
-      ${metricResult("Reps", metrics.reps)}
-      ${metricResult("Dauer", formatDuration(pendingRecording.durationMs))}
-      ${metricResult("Ø Rep", formatMilliseconds(metrics.avgRepDurationMs))}
-      ${metricResult("Amplitude", formatNumber(metrics.amplitudeEstimate, 3))}
-      ${metricResult("ROM", formatRomMetric(metrics, pendingRecording.comparison))}
-      ${metricResult("Smoothness", `${metrics.smoothnessScore} %`)}
-      ${metricResult("Tremor", formatNumber(metrics.tremorScore, 2))}
-      ${metricResult("Stabilität", `${metrics.stabilityScore} %`)}
-      ${metricResult("Fatigue", metrics.fatigue?.fatigueDetected ? `ab Rep ${metrics.fatigue.fatigueStartRep}` : "Nein")}
-      ${metricResult("Grenzwertig", metrics.warningRepCount || 0)}
-      ${metricResult("Schlecht/unsicher", (metrics.badRepCount || 0) + (metrics.uncertainRepCount || 0))}
-      ${metricResult("Hauptgrund", metrics.mainIssue || "—")}
-      ${metricResult("Achse", metrics.dominantAxis)}
-    </div>
+    ${renderRepFeedbackList(metrics.repMetrics)}
+    <details class="details-panel metric-details">
+      <summary>Technische Metriken anzeigen</summary>
+      <div class="result-grid">
+        ${metricResult("Dauer", formatDuration(pendingRecording.durationMs))}
+        ${metricResult("Ø Rep", formatMilliseconds(metrics.avgRepDurationMs))}
+        ${metricResult("Amplitude", formatNumber(metrics.amplitudeEstimate, 3))}
+        ${metricResult("ROM", formatRomMetric(metrics, pendingRecording.comparison))}
+        ${metricResult("Smoothness", `${metrics.smoothnessScore} %`)}
+        ${metricResult("Tremor", formatNumber(metrics.tremorScore, 2))}
+        ${metricResult("Fatigue", metrics.fatigue?.fatigueDetected ? `ab Rep ${metrics.fatigue.fatigueStartRep}` : "Nein")}
+        ${metricResult("Grenzwertig", metrics.warningRepCount || 0)}
+        ${metricResult("Schlecht/unsicher", (metrics.badRepCount || 0) + (metrics.uncertainRepCount || 0))}
+        ${metricResult("Hauptgrund", metrics.mainIssue || "—")}
+        ${metricResult("Achse", metrics.dominantAxis)}
+      </div>
+    </details>
     <ul>${feedback.map((message) => `<li>${escapeHtml(message)}</li>`).join("")}</ul>
   `;
 }
@@ -2416,6 +4401,26 @@ function metricResult(label, value) {
   return `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(String(value))}</strong></div>`;
 }
 
+function renderRepFeedbackList(repMetrics = []) {
+  if (!repMetrics.length) {
+    return '<p class="muted">Noch keine vollständigen Wiederholungen erkannt.</p>';
+  }
+  return `
+    <div class="rep-feedback-list">
+      ${repMetrics.map((rep) => `
+        <div class="rep-pill rep-${escapeHtml(rep.qualityClass || "uncertain")}">
+          <strong>Rep ${rep.repNumber}</strong>
+          <span>${escapeHtml(rep.feedbackText || repQualityLabel(rep.qualityClass))}</span>
+          <small>
+            ${rep.romPercent !== null ? `ROM ${Math.round(rep.romPercent)} % · ` : ""}
+            ${formatMilliseconds(rep.durationMs)} · ${escapeHtml(tremorLevelLabel(rep.tremorLevel))}
+          </small>
+        </div>
+      `).join("")}
+    </div>
+  `;
+}
+
 function renderAthleteSummary(metrics = emptyMetrics(), comparison = null, exercise = getSelectedExercise()) {
   const recommendation = metrics.recommendation || generateTrainingRecommendation(metrics, comparison, exercise);
   const fatigueText = metrics.fatigue?.fatigueDetected ? `ab Rep ${metrics.fatigue.fatigueStartRep}` : "nicht deutlich";
@@ -2454,6 +4459,14 @@ function renderAthleteSummary(metrics = emptyMetrics(), comparison = null, exerc
       <p>${escapeHtml(recommendation.message)}</p>
     </article>
   `;
+}
+
+function tremorLevelLabel(level) {
+  return {
+    low: "Ruckeln niedrig",
+    medium: "Ruckeln erhöht",
+    high: "Ruckeln hoch",
+  }[level] || "Ruckeln —";
 }
 
 function formatRomMetric(metrics, comparison = null) {
@@ -2529,13 +4542,24 @@ function updateCurrentValues(sample) {
 
 function updateLiveTrainingValues(metrics = liveAnalysis) {
   elements.sampleCount.textContent = metrics.dominantAxis || "—";
-  elements.values.accMagnitude.textContent = metrics.reps ? `${Math.round(metrics.stabilityScore)} %` : "—";
+  const lastRep = metrics.repMetrics?.at(-1);
+  elements.values.accMagnitude.textContent = lastRep ? repQualityLabel(lastRep.qualityClass) : "—";
   elements.values.gyroMagnitude.textContent = metrics.reps ? tremorLabel(metrics.tremorScore) : "—";
+}
+
+function repQualityLabel(qualityClass) {
+  return {
+    clean: "Sauber",
+    warning: "Grenzwertig",
+    bad: "Schlecht",
+    uncertain: "Unsicher",
+  }[qualityClass] || "—";
 }
 
 function resetLiveDisplay() {
   elements.recordingTime.textContent = "00:00.0";
   elements.sampleCount.textContent = "—";
+  if (elements.debugSampleCount) elements.debugSampleCount.textContent = "0";
   elements.liveRepCount.textContent = "0";
   elements.sampleTimestamp.textContent = "t = — ms";
   Object.values(elements.values).forEach((element) => {
@@ -2618,11 +4642,11 @@ function drawCharts() {
   const metrics = recording || samples.length ? analyzeRecordingByMode(samples, exercise) : emptyMetrics();
   elements.livePrimaryChartTitle.textContent = metrics.signals.primaryLabel;
   elements.liveSecondaryChartTitle.textContent = metrics.signals.secondaryLabel;
-  drawSignalChart(elements.accChart, metrics.signals.timestamps, metrics.signals.primary, "#52e0a0", metrics.repTimestamps, "Noch keine Aufnahmedaten");
-  drawSignalChart(elements.gyroChart, metrics.signals.timestamps, metrics.signals.secondary, "#62a4ff", metrics.repTimestamps, "Noch keine Aufnahmedaten");
+  drawSignalChart(elements.accChart, metrics.signals.timestamps, metrics.signals.primary, "#52e0a0", metrics.repTimestamps, "Noch keine Aufnahmedaten", metrics.repSegments);
+  drawSignalChart(elements.gyroChart, metrics.signals.timestamps, metrics.signals.secondary, "#62a4ff", metrics.repTimestamps, "Noch keine Aufnahmedaten", metrics.repSegments);
 }
 
-function drawSignalChart(canvas, timestamps, values, color, repTimestamps = [], emptyText = "Keine Daten") {
+function drawSignalChart(canvas, timestamps, values, color, repTimestamps = [], emptyText = "Keine Daten", repSegments = []) {
   const chart = prepareCanvas(canvas);
   if (!chart) return;
   const { context, width, height } = chart;
@@ -2642,6 +4666,16 @@ function drawSignalChart(canvas, timestamps, values, color, repTimestamps = [], 
   drawAxisLabels(context, range, padding, chartHeight);
   const firstTimestamp = visibleTimestamps[0] || 0;
   const lastTimestamp = visibleTimestamps.at(-1) || firstTimestamp + 1;
+  repSegments
+    .filter((segment) => segment.endTimestamp >= firstTimestamp && segment.startTimestamp <= lastTimestamp)
+    .forEach((segment) => {
+      const startX = padding.left + clamp((segment.startTimestamp - firstTimestamp) / Math.max(lastTimestamp - firstTimestamp, 1), 0, 1) * chartWidth;
+      const endX = padding.left + clamp((segment.endTimestamp - firstTimestamp) / Math.max(lastTimestamp - firstTimestamp, 1), 0, 1) * chartWidth;
+      context.save();
+      context.fillStyle = "rgba(82, 224, 160, 0.08)";
+      context.fillRect(startX, padding.top, Math.max(2, endX - startX), chartHeight);
+      context.restore();
+    });
   repTimestamps
     .filter((timestamp) => timestamp >= firstTimestamp && timestamp <= lastTimestamp)
     .forEach((timestamp) => {
@@ -2699,6 +4733,8 @@ function drawSingleChart(canvas, data, property, color, repTimestamps = []) {
 
 function drawAnalysisCharts() {
   const exercise = getSelectedExercise();
+  const isWeightStack = normalizeAnalysisMode(exercise?.analysisMode, exercise?.equipmentType) === "weight_stack";
+  if (elements.overlaySecondaryChartCard) elements.overlaySecondaryChartCard.hidden = isWeightStack;
   const recordings = getExerciseRecordings(exercise)
     .filter((recordingData) => selectedAnalysisRecordingIds.has(recordingData.id));
   const chartMetrics = recordings.map((recordingData) => ({
@@ -2725,7 +4761,9 @@ function updateMetricChartTitles(exercise) {
   elements.metricChartOneTitle.textContent = mode === "barbell" ? "ROMProxy pro Rep" : "AmplitudeProxy pro Rep";
   elements.metricChartTwoTitle.textContent = "Rep-Dauer pro Rep";
   elements.metricChartThreeTitle.textContent = mode === "weight_stack" ? "Tremor/Jerk pro Rep" : "Wobble/Tremor pro Rep";
-  elements.metricChartFourTitle.textContent = mode === "barbell" ? "Tilt-/Rotation-Score" : "Gyro-Stabilität pro Rep";
+  elements.metricChartFourTitle.textContent = mode === "barbell"
+    ? "Tilt-/Rotation-Score"
+    : mode === "weight_stack" ? "Sensorcheck / Gyro Debug" : "Gyro-Stabilität pro Rep";
 }
 
 function getSelectedStabilityMetric(exercise) {
@@ -2972,6 +5010,18 @@ elements.exportExerciseSelect.addEventListener("change", () => {
 elements.connectButton.addEventListener("click", connectBle);
 elements.demoButton.addEventListener("click", startDemo);
 elements.calibrateButton.addEventListener("click", startCalibration);
+elements.audioFeedbackToggle.addEventListener("change", () => {
+  audioFeedbackEnabled = elements.audioFeedbackToggle.checked;
+  audioQueue = [];
+  audioProcessing = false;
+  if (audioFeedbackEnabled && !("speechSynthesis" in window)) {
+    audioFeedbackEnabled = false;
+    elements.audioFeedbackToggle.checked = false;
+    showMessage("Audiofeedback wird von diesem Browser nicht unterstützt.", "info", true);
+  } else if (audioFeedbackEnabled) {
+    speakFeedback("Audiofeedback aktiv.");
+  }
+});
 elements.demoProfile.addEventListener("change", () => {
   if (isDemoActive()) {
     setDemoStatus(`${demoProfileLabel(elements.demoProfile.value)} aktiv`, "demo");
