@@ -14,41 +14,49 @@ const MIN_ANALYSIS_SAMPLES = 20;
 const CHART_COLORS = ["#52e0a0", "#62a4ff", "#ffc857", "#b18cff", "#ff7f91", "#55d8e8"];
 
 const defaultWeightStackOptions = {
-  accUnit: "g",
-  restMs: 1200,
+  accUnit: "g", // "g", "mps2", "raw_mpu6050"
+  mpuAccelRangeG: 4,
+  lsbPerG: null,
+  restMs: 1500,
   minRepMs: 700,
-  maxRepMs: 8000,
-  minPhaseMs: 250,
+  maxRepMs: 9000,
+  minPhaseMs: 220,
   refractoryMs: 250,
+  cutoffHz: 6,
+  velocityLeak: 0.995,
+  positionLeak: 0.999,
+  minActivityG: 0.025,
   enableRestCalibration: true,
-  enableAutoAxisDetection: true,
-  enable3DProjection: true,
+  enableRestQualityCheck: true,
+  enableMotionAxisPca: true,
+  enableDominantAxisFallback: true,
   enableLowPassFilter: true,
-  enableVelocityIntegration: true,
-  enablePositionProxy: true,
+  enableBoundedIntegration: true,
+  enableZuptReset: true,
   enableStateMachine: true,
-  enableAdaptiveThresholds: true,
+  enableMagnitudeMinusGDiagnostic: true,
+  useMagnitudeMinusGAsPrimary: false,
+  enableExperimentalDistance: false,
+  cmPerPositionProxy: null,
   enableRomBaseline: true,
   enablePartialRepDetection: true,
+  partialRepRomRatio: 0.75,
   enableTempoFlags: true,
+  controlledDownMinMs: 600,
   enableDroppedWeightDetection: true,
+  droppedWeightSpikeG: 0.45,
   enableJerkDetection: true,
+  jerkThreshold: null,
   enableVelocityLoss: true,
+  enableDebug: true,
+  debugKeepArrays: true,
+  // Backward-compatible optional/debug toggles from earlier MVP iterations.
   enableGyroAssist: false,
   enableAutocorrelationHint: false,
   enableTemplateMatching: false,
   enableExerciseProfiles: true,
-  enableDebug: true,
-  debugKeepArrays: true,
-  cutoffHz: 6,
-  leak: 0.995,
-  minActivityG: 0.04,
   startVelocityThreshold: null,
   minAmplitude: null,
-  partialRepRomRatio: 0.75,
-  controlledDownMinMs: 600,
-  droppedWeightSpikeG: 1.2,
-  jerkThreshold: null,
 };
 
 const WEIGHT_STACK_EXERCISE_PROFILES = {
@@ -411,6 +419,11 @@ function normalizeSample(sample) {
     gy: Number(sample.gy),
     gz: Number(sample.gz),
   };
+  const distanceValue = Number(sample.distanceMm ?? sample.ultrasoundMm);
+  normalized.distanceMm = Number.isFinite(distanceValue) && distanceValue > 0 ? distanceValue : null;
+  normalized.ultrasoundMm = normalized.distanceMm;
+  normalized.hasUltrasound = Boolean(sample.hasUltrasound) || "distanceMm" in sample || "ultrasoundMm" in sample;
+  normalized.ultrasoundValid = normalized.distanceMm !== null;
   normalized.accMagnitude = Number.isFinite(Number(sample.accMagnitude))
     ? Number(sample.accMagnitude)
     : Math.hypot(normalized.ax, normalized.ay, normalized.az);
@@ -634,7 +647,12 @@ function generateDemoSample() {
   const gx = gyroScale * velocity + jerk * (mode === "weight_stack" ? 18 : 95) + randomNoise() * (mode === "weight_stack" ? 2 : 20);
   const gy = gyroScale * 0.35 * direction + randomNoise() * (mode === "weight_stack" ? 2 : 18);
   const gz = gyroScale * 0.18 * velocity + jerk * (mode === "weight_stack" ? 12 : 55) + randomNoise() * (mode === "weight_stack" ? 2 : 18);
-  const line = [Math.round(elapsedMs), ax, ay, az, gx, gy, gz].join(",");
+  const distanceMm = mode === "weight_stack"
+    ? Math.max(80, 760 - smoothPulse * amplitude * 210 + randomNoise() * 8)
+    : null;
+  const line = mode === "weight_stack"
+    ? [Math.round(elapsedMs), ax, ay, az, gx, gy, gz, distanceMm].join(",")
+    : [Math.round(elapsedMs), ax, ay, az, gx, gy, gz].join(",");
 
   processDataLine(line, "Demo");
 }
@@ -654,14 +672,22 @@ function demoProfileLabel(profile) {
 // ---------------------------------------------------------------------------
 
 function isValidDataLine(line) {
-  if (!line || line.split(",").length !== 7) return false;
-  return line.split(",").every((part) => part.trim() !== "" && Number.isFinite(Number(part)));
+  if (!line) return false;
+  const parts = line.trim().split(",");
+  if (parts.length !== 7 && parts.length !== 8) return false;
+  return parts.every((part) => part.trim() !== "" && Number.isFinite(Number(part)));
 }
 
 function parseDataLine(line) {
   if (!isValidDataLine(line)) return null;
-  const [timestamp, ax, ay, az, gx, gy, gz] = line.split(",").map(Number);
+  const parts = line.trim().split(",");
+  const values = parts.map(Number);
+  const [timestamp, ax, ay, az, gx, gy, gz, distanceMmRaw] = values;
   if (timestamp < 0) return null;
+  const hasUltrasound = parts.length === 8;
+  const distanceMm = hasUltrasound && Number.isFinite(distanceMmRaw) && distanceMmRaw > 0
+    ? distanceMmRaw
+    : null;
   return {
     timestamp,
     ax,
@@ -670,6 +696,10 @@ function parseDataLine(line) {
     gx,
     gy,
     gz,
+    distanceMm,
+    ultrasoundMm: distanceMm,
+    hasUltrasound,
+    ultrasoundValid: distanceMm !== null,
     accMagnitude: Math.hypot(ax, ay, az),
     gyroMagnitude: Math.hypot(gx, gy, gz),
   };
@@ -1010,30 +1040,39 @@ function copySample(sample) {
     gx: sample.gx,
     gy: sample.gy,
     gz: sample.gz,
+    distanceMm: sample.distanceMm ?? null,
+    ultrasoundMm: sample.ultrasoundMm ?? sample.distanceMm ?? null,
+    hasUltrasound: Boolean(sample.hasUltrasound),
+    ultrasoundValid: sample.ultrasoundValid === true || Number.isFinite(Number(sample.distanceMm)),
     accMagnitude: sample.accMagnitude,
     gyroMagnitude: sample.gyroMagnitude,
   };
 }
 
-function normalizeWeightStackInputSamples(inputSamples) {
+function normalizeWeightStackInputSamples(inputSamples, options = {}) {
+  const optionsUsed = mergeWeightStackOptions(options);
   return inputSamples.map((sample, index) => {
-    const accel = extractAccelSample(sample);
+    const accel = normalizeMpuSample(sample, index, optionsUsed);
     if (!accel) return null;
-    const timestamp = firstFinite(sample?.timestamp, sample?.time, sample?.t, index * 20);
-    const gx = firstFinite(sample?.gx, sample?.gyroX, sample?.rx, 0);
-    const gy = firstFinite(sample?.gy, sample?.gyroY, sample?.ry, 0);
-    const gz = firstFinite(sample?.gz, sample?.gyroZ, sample?.rz, 0);
+    const timestamp = firstFinite(accel.timestamp, index * 20);
+    const gx = firstFinite(accel.gxDps, 0);
+    const gy = firstFinite(accel.gyDps, 0);
+    const gz = firstFinite(accel.gzDps, 0);
     return {
       timestamp,
-      ax: accel.ax,
-      ay: accel.ay,
-      az: accel.az,
+      ax: accel.axG,
+      ay: accel.ayG,
+      az: accel.azG,
       gx,
       gy,
       gz,
-      accMagnitude: Math.hypot(accel.ax, accel.ay, accel.az),
+      accMagnitude: Math.hypot(accel.axG, accel.ayG, accel.azG),
       gyroMagnitude: Math.hypot(gx, gy, gz),
-      rawPrimary: accel.value,
+      distanceMm: accel.distanceMm,
+      ultrasoundMm: accel.ultrasoundMm,
+      hasUltrasound: accel.hasUltrasound,
+      ultrasoundValid: accel.ultrasoundValid,
+      rawPrimary: accel.axG,
       has3d: accel.has3d,
     };
   }).filter(Boolean);
@@ -1130,31 +1169,80 @@ function estimateSampleRate(timestamps = []) {
   return intervalMs ? 1000 / intervalMs : 0;
 }
 
-function extractAccelSample(sample) {
+function getMpuLsbPerG(options = {}) {
+  if (hasNumericWeightStackOption(options.lsbPerG)) return Number(options.lsbPerG);
+  return {
+    2: 16384,
+    4: 8192,
+    8: 4096,
+    16: 2048,
+  }[Number(options.mpuAccelRangeG) || 4] || 8192;
+}
+
+function convertAccelerationToG(value, options = {}) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return NaN;
+  if (options.accUnit === "raw_mpu6050") return number / getMpuLsbPerG(options);
+  if (options.accUnit === "mps2") return number / 9.80665;
+  return number;
+}
+
+function normalizeMpuSample(sample, index = 0, options = {}) {
+  const timestamp = firstFinite(sample?.timestamp, sample?.time, sample?.t, NaN);
+  const raw = sample;
+  const distanceCandidate = firstFinite(sample?.distanceMm, sample?.ultrasoundMm, NaN);
+  const distanceMm = Number.isFinite(distanceCandidate) && distanceCandidate > 0 ? distanceCandidate : null;
+
   if (Array.isArray(sample)) {
-    const ax = Number(sample[0]);
-    const ay = Number(sample[1]);
-    const az = Number(sample[2]);
-    if ([ax, ay, az].every(Number.isFinite)) return { ax, ay, az, has3d: true };
-    const value = Number(sample[0]);
-    return Number.isFinite(value) ? { ax: value, ay: 0, az: 0, value, has3d: false } : null;
+    const axG = convertAccelerationToG(sample[0], options);
+    const ayG = convertAccelerationToG(sample[1], options);
+    const azG = convertAccelerationToG(sample[2], options);
+    if ([axG, ayG, azG].every(Number.isFinite)) {
+      return { timestamp, axG, ayG, azG, gxDps: 0, gyDps: 0, gzDps: 0, has3d: true, hasGyro: false, distanceMm: null, ultrasoundMm: null, hasUltrasound: false, ultrasoundValid: false, raw };
+    }
+    const valueG = convertAccelerationToG(sample[0], options);
+    return Number.isFinite(valueG)
+      ? { timestamp, axG: valueG, ayG: 0, azG: 0, gxDps: 0, gyDps: 0, gzDps: 0, has3d: false, hasGyro: false, distanceMm: null, ultrasoundMm: null, hasUltrasound: false, ultrasoundValid: false, raw }
+      : null;
   }
 
   if (Number.isFinite(Number(sample))) {
-    const value = Number(sample);
-    return { ax: value, ay: 0, az: 0, value, has3d: false };
+    const valueG = convertAccelerationToG(sample, options);
+    return { timestamp, axG: valueG, ayG: 0, azG: 0, gxDps: 0, gyDps: 0, gzDps: 0, has3d: false, hasGyro: false, distanceMm: null, ultrasoundMm: null, hasUltrasound: false, ultrasoundValid: false, raw };
   }
 
   if (!sample || typeof sample !== "object") return null;
 
-  const ax = firstFinite(sample.ax, sample.accelX, sample.x);
-  const ay = firstFinite(sample.ay, sample.accelY, sample.y);
-  const az = firstFinite(sample.az, sample.accelZ, sample.z);
-  if ([ax, ay, az].every(Number.isFinite)) return { ax, ay, az, has3d: true };
+  const axG = convertAccelerationToG(firstFinite(sample.ax, sample.accelX, sample.x), options);
+  const ayG = convertAccelerationToG(firstFinite(sample.ay, sample.accelY, sample.y), options);
+  const azG = convertAccelerationToG(firstFinite(sample.az, sample.accelZ, sample.z), options);
+  const gxDps = firstFinite(sample.gx, sample.gyroX, sample.rx, 0);
+  const gyDps = firstFinite(sample.gy, sample.gyroY, sample.ry, 0);
+  const gzDps = firstFinite(sample.gz, sample.gyroZ, sample.rz, 0);
+  const hasGyro = [gxDps, gyDps, gzDps].some((value) => Number.isFinite(value) && Math.abs(value) > 0);
 
-  const value = firstFinite(sample.rawPrimary, sample.value, sample.acc, sample.accMagnitude, sample.magnitude);
-  if (Number.isFinite(value)) return { ax: value, ay: 0, az: 0, value, has3d: false };
+  if ([axG, ayG, azG].every(Number.isFinite)) {
+    return { timestamp, axG, ayG, azG, gxDps, gyDps, gzDps, has3d: true, hasGyro, distanceMm, ultrasoundMm: distanceMm, hasUltrasound: Boolean(sample.hasUltrasound) || "distanceMm" in sample || "ultrasoundMm" in sample, ultrasoundValid: distanceMm !== null, raw };
+  }
+
+  const valueG = convertAccelerationToG(firstFinite(sample.rawPrimary, sample.value, sample.acc, sample.accMagnitude, sample.magnitude), options);
+  if (Number.isFinite(valueG)) {
+    return { timestamp, axG: valueG, ayG: 0, azG: 0, gxDps, gyDps, gzDps, has3d: false, hasGyro, distanceMm, ultrasoundMm: distanceMm, hasUltrasound: Boolean(sample.hasUltrasound) || "distanceMm" in sample || "ultrasoundMm" in sample, ultrasoundValid: distanceMm !== null, raw };
+  }
   return null;
+}
+
+function extractAccelSample(sample) {
+  const normalized = normalizeMpuSample(sample, 0, { accUnit: "g" });
+  return normalized
+    ? {
+        ax: normalized.axG,
+        ay: normalized.ayG,
+        az: normalized.azG,
+        value: normalized.axG,
+        has3d: normalized.has3d,
+      }
+    : null;
 }
 
 function firstFinite(...values) {
@@ -1246,7 +1334,7 @@ function analyzeRecordingByMode(recordingData, exercise = null) {
   if (!Array.isArray(inputSamples) || inputSamples.length === 0) return emptyMetrics();
   const mode = normalizeAnalysisMode(exercise?.analysisMode, exercise?.equipmentType);
   if (mode === "weight_stack") {
-    const normalizedWeightStackSamples = normalizeWeightStackInputSamples(inputSamples);
+    const normalizedWeightStackSamples = normalizeWeightStackInputSamples(inputSamples, exercise?.weightStackOptions || {});
     if (!normalizedWeightStackSamples.length) return emptyMetrics();
     return analyzeWeightStack(normalizedWeightStackSamples, exercise);
   }
@@ -1324,20 +1412,24 @@ function analyzeMode(inputSamples, exercise, config) {
       });
 
   const weightStackDebug = config.mode === "weight_stack" ? getWeightStackRepDebug() : null;
+  if (config.mode === "weight_stack" && weightStackDebug?.restInfo?.restQuality && weightStackDebug.restInfo.restQuality !== "good") {
+    sensorQuality.status = sensorQuality.status === "good" ? "warning" : sensorQuality.status;
+    sensorQuality.issues.push(`Rest calibration ${weightStackDebug.restInfo.restQuality}`);
+  }
 
   const primarySignal =
     config.mode === "weight_stack" &&
-    weightStackDebug?.arrays?.position?.length === prepared.filteredPrimary.length
-      ? weightStackDebug.arrays.position
+    weightStackDebug?.arrays?.positionProxy?.length === prepared.filteredPrimary.length
+      ? weightStackDebug.arrays.positionProxy
       : config.mode === "weight_stack" &&
-          weightStackDebug?.arrays?.filteredAcc?.length === prepared.filteredPrimary.length
-        ? weightStackDebug.arrays.filteredAcc
+          weightStackDebug?.arrays?.filteredAccG?.length === prepared.filteredPrimary.length
+        ? weightStackDebug.arrays.filteredAccG
         : prepared.filteredPrimary;
 
   const secondarySignal =
     config.mode === "weight_stack" &&
-    weightStackDebug?.arrays?.velocity?.length === prepared.secondary.length
-      ? weightStackDebug.arrays.velocity
+    weightStackDebug?.arrays?.velocityProxy?.length === prepared.secondary.length
+      ? weightStackDebug.arrays.velocityProxy
       : prepared.secondary;
 
   const repSegments = segmentReps(prepared.samples, repMarkers).map((segment) => ({
@@ -1448,8 +1540,10 @@ function analyzeMode(inputSamples, exercise, config) {
       primary: primarySignal,
       secondary: secondarySignal,
       timestamps: prepared.timestamps,
-      primaryLabel: config.mode === "weight_stack" ? "ROM-/Position-Proxy" : config.primaryLabel,
-      secondaryLabel: config.mode === "weight_stack" ? "Velocity-Proxy" : config.secondaryLabel,
+      primaryLabel: config.mode === "weight_stack"
+        ? (weightStackDebug?.ultrasound?.available ? "Ultraschall-ROM / Position-Proxy" : "ROM-/Position-Proxy")
+        : config.primaryLabel,
+      secondaryLabel: config.mode === "weight_stack" ? "Velocity-/Control-Proxy" : config.secondaryLabel,
 },
   };
 }
@@ -1568,12 +1662,18 @@ function mergeWeightStackOptions(options = {}) {
   const profile = options.enableExerciseProfiles === false
     ? {}
     : WEIGHT_STACK_EXERCISE_PROFILES[requestedProfile] || WEIGHT_STACK_EXERCISE_PROFILES.default;
-  return {
+  const merged = {
     ...defaultWeightStackOptions,
     ...profile,
     ...options,
     exerciseKey: requestedProfile,
   };
+  if (hasNumericWeightStackOption(options.leak) && !hasNumericWeightStackOption(options.velocityLeak)) {
+    merged.velocityLeak = Number(options.leak);
+  }
+  if (options.enableVelocityIntegration === false) merged.enableBoundedIntegration = false;
+  if (options.enablePositionProxy === false) merged.enableBoundedIntegration = false;
+  return merged;
 }
 
 function hasNumericWeightStackOption(value) {
@@ -1583,224 +1683,484 @@ function hasNumericWeightStackOption(value) {
 function detectWeightStackRepsIMU(samples, timestamps = [], options = {}) {
   const optionsUsed = mergeWeightStackOptions(options);
   const input = Array.isArray(samples) ? samples : [];
-  const resolvedTimestamps = resolveWeightStackTimestamps(input, timestamps);
-  const sampleRate = estimateSampleRate(resolvedTimestamps);
-  const rejectedCandidates = [];
-
-  const extracted = input.map(extractAccelSample);
-  const validIndexes = extracted
+  const timestampInfo = resolveWeightStackTimestamps(input, timestamps);
+  const resolvedTimestamps = timestampInfo.timestamps;
+  const warnings = [...timestampInfo.warnings];
+  const normalized = input.map((sample, index) => normalizeMpuSample(sample, index, optionsUsed));
+  const validIndexes = normalized
     .map((sample, index) => sample ? index : -1)
     .filter((index) => index >= 0 && Number.isFinite(resolvedTimestamps[index]));
 
   if (validIndexes.length < 8) {
+    warnings.push("Too few valid samples for weight-stack IMU detection.");
     lastWeightStackRepDebug = buildWeightStackDebug({
-      mode: "fallback_1d",
-      warning: "Too few valid samples for weight-stack IMU detection.",
+      mode: "axis_projection_bounded",
+      warning: warnings.join(" "),
+      warnings,
       optionsUsed,
       sampleCount: input.length,
       timestampCount: resolvedTimestamps.length,
-      estimatedSampleRate: sampleRate,
+      estimatedSampleRate: estimateSampleRate(resolvedTimestamps),
       reps: [],
-      rejectedCandidates,
+      rejectedCandidates: [],
     });
     return [];
   }
 
-  const accel = validIndexes.map((index) => extracted[index]);
-  const localTimestamps = validIndexes.map((index) => resolvedTimestamps[index]);
-  const has3dRatio = accel.filter((sample) => sample.has3d).length / accel.length;
-  const use3d = has3dRatio >= 0.8 && optionsUsed.enable3DProjection !== false;
-  const mode = use3d ? "imu_3d" : "fallback_1d";
-  const warning = use3d ? null : "Only 1D signal available; 3D IMU projection disabled.";
-  const restSampleCount = estimateRestSampleCount(localTimestamps, optionsUsed.restMs);
-  const restSlice = accel.slice(0, restSampleCount);
+  const imuSamples = validIndexes.map((index) => ({
+    ...normalized[index],
+    timestamp: resolvedTimestamps[index],
+  }));
+  const localTimestamps = imuSamples.map((sample) => sample.timestamp);
+  const ultrasoundInfo = buildUltrasoundKinematics(imuSamples, localTimestamps, optionsUsed);
+  const has3d = imuSamples.filter((sample) => sample.has3d).length / imuSamples.length >= 0.8;
+  if (!has3d) warnings.push("Only 1D signal available; 3D IMU projection disabled.");
 
-  const g0 = use3d && optionsUsed.enableRestCalibration
+  const restInfo = calibrateWeightStackRest(imuSamples, localTimestamps, optionsUsed);
+  warnings.push(...restInfo.warnings);
+
+  const linearAccVectors = imuSamples.map((sample) => has3d
     ? [
-        mean(restSlice.map((sample) => sample.ax)),
-        mean(restSlice.map((sample) => sample.ay)),
-        mean(restSlice.map((sample) => sample.az)),
+        sample.axG - restInfo.gVec.x,
+        sample.ayG - restInfo.gVec.y,
+        sample.azG - restInfo.gVec.z,
       ]
-    : [0, 0, 0];
-
-  const oneDBias = !use3d && optionsUsed.enableRestCalibration
-    ? mean(restSlice.map((sample) => Number(sample.value ?? sample.ax) || 0))
-    : 0;
-
-  const linear = accel.map((sample) => use3d
-    ? [sample.ax - g0[0], sample.ay - g0[1], sample.az - g0[2]]
-    : [Number(sample.value ?? sample.ax) - oneDBias, 0, 0],
+    : [sample.axG - restInfo.oneDBias, 0, 0],
   );
 
-  const restLinear = linear.slice(0, restSampleCount);
-  const axisVariance = use3d
-    ? [
-        variance(linear.slice(restSampleCount).map((value) => value[0])),
-        variance(linear.slice(restSampleCount).map((value) => value[1])),
-        variance(linear.slice(restSampleCount).map((value) => value[2])),
-      ]
-    : [variance(linear.map((value) => value[0])), 0, 0];
-  const dominantAxisIndex = axisVariance.indexOf(Math.max(...axisVariance));
-  const dominantAxis = ["ax", "ay", "az"][dominantAxisIndex] || "ax";
-  const movementAxis = use3d && optionsUsed.enableAutoAxisDetection !== false && optionsUsed.enable3DProjection !== false
-    ? normalizeVec([
-        dominantAxisIndex === 0 ? 1 : 0,
-        dominantAxisIndex === 1 ? 1 : 0,
-        dominantAxisIndex === 2 ? 1 : 0,
-      ])
-    : [1, 0, 0];
+  const axisInfo = has3d
+    ? estimateMotionAxisPca(linearAccVectors, localTimestamps, restInfo.restEndIndex, optionsUsed)
+    : {
+        method: "fallback_1d",
+        movementAxis: [1, 0, 0],
+        dominantAxis: "ax",
+        variance: { ax: variance(linearAccVectors.map((v) => v[0])), ay: 0, az: 0 },
+        explainedRatio: 1,
+      };
 
-  let projectedAcc = use3d && optionsUsed.enable3DProjection !== false
-    ? linear.map((value) => dot(value, movementAxis))
-    : linear.map((value) => value[0]);
+  let projectedAccG = projectOntoAxis(linearAccVectors, axisInfo.movementAxis);
+  if (optionsUsed.useMagnitudeMinusGAsPrimary) {
+    warnings.push("Using magnitude-minus-g as primary is diagnostic/fallback mode, not recommended for guided weight-stack counting.");
+  }
+  const magnitudeMinusG = imuSamples.map((sample) => Math.hypot(sample.axG, sample.ayG, sample.azG) - restInfo.gMagnitude);
+  if (optionsUsed.useMagnitudeMinusGAsPrimary) projectedAccG = magnitudeMinusG.slice();
 
-  if (Math.abs(percentile(projectedAcc, 0.05)) > Math.abs(percentile(projectedAcc, 0.95))) {
-    projectedAcc = projectedAcc.map((value) => -value);
+  const firstActiveIndex = findFirstActiveIndex(projectedAccG, restInfo.restEndIndex, optionsUsed.minActivityG);
+  if (firstActiveIndex !== null && projectedAccG[firstActiveIndex] < 0) {
+    projectedAccG = projectedAccG.map((value) => -value);
+    axisInfo.movementAxis = axisInfo.movementAxis.map((value) => -value);
   }
 
-  const restProjected = projectedAcc.slice(0, restSampleCount);
-  const restSigma = optionsUsed.enableRestCalibration ? std(restProjected) : std(projectedAcc.slice(0, Math.min(20, projectedAcc.length)));
-  const filteredAcc = optionsUsed.enableLowPassFilter
-    ? lowPassIIR(projectedAcc, localTimestamps, optionsUsed.cutoffHz)
-    : projectedAcc.slice();
-  const kinematics = integrateWeightStackSignal(filteredAcc, localTimestamps, restSigma, optionsUsed);
-  let { velocity, position } = kinematics;
-  if (optionsUsed.enablePositionProxy !== false) {
-    const baselineWindow = Math.max(9, Math.round(2200 / Math.max(estimateIntervalFromTimestamps(localTimestamps), 1)));
-    const positionBaseline = movingAverage(position, baselineWindow);
-    position = position.map((value, index) => value - positionBaseline[index]);
-  }
+  const filteredAccG = optionsUsed.enableLowPassFilter
+    ? lowPassIIR(projectedAccG, localTimestamps, optionsUsed.cutoffHz)
+    : projectedAccG.slice();
 
-  if (Math.abs(percentile(position, 0.05)) > Math.abs(percentile(position, 0.95))) {
-    position = position.map((value) => -value);
-    velocity = velocity.map((value) => -value);
-  }
+  const kinematics = ultrasoundInfo.available
+    ? ultrasoundInfo.kinematics
+    : integrateBoundedWeightStackMotion(filteredAccG, localTimestamps, restInfo, optionsUsed);
+  kinematics.projectedAccG = projectedAccG;
+  kinematics.filteredAccG = filteredAccG;
+  kinematics.magnitudeMinusG = magnitudeMinusG;
+  kinematics.movementAxis = axisInfo.movementAxis;
+  kinematics.restInfo = restInfo;
+  kinematics.warnings = warnings;
+  kinematics.timestamps = localTimestamps;
+  kinematics.ultrasound = ultrasoundInfo;
 
-  const positionRange = percentile(position, 0.95) - percentile(position, 0.05);
-  const activityThreshold = optionsUsed.enableAdaptiveThresholds
-    ? Math.max(optionsUsed.minActivityG, 5 * restSigma)
-    : optionsUsed.minActivityG;
-  const velocityAbs = velocity.map(Math.abs);
-  const velocityThreshold = hasNumericWeightStackOption(optionsUsed.startVelocityThreshold)
-    ? Number(optionsUsed.startVelocityThreshold)
-    : Math.max(percentile(velocityAbs, 0.62), activityThreshold * 0.06, 0.0003);
-  const minAmplitude = hasNumericWeightStackOption(optionsUsed.minAmplitude)
-    ? Number(optionsUsed.minAmplitude)
-    : Math.max(positionRange * 0.22, activityThreshold * 0.012, 0.0005);
-
-  const stateResult = optionsUsed.enableStateMachine
-    ? runWeightStackStateMachine({
-        position,
-        velocity,
-        filteredAcc,
-        timestamps: localTimestamps,
-        options: optionsUsed,
-        thresholds: { activityThreshold, velocityThreshold, minAmplitude },
-      })
-    : runWeightStackSimpleCycleFallback({
-        position,
-        velocity,
-        filteredAcc,
-        timestamps: localTimestamps,
-        options: optionsUsed,
-        thresholds: { activityThreshold, velocityThreshold, minAmplitude },
-      });
-
-  const reps = enrichWeightStackReps(stateResult.reps, {
-    filteredAcc,
-    velocity,
-    position,
-    timestamps: localTimestamps,
-    options: optionsUsed,
-  });
-
-  const mappedReps = reps.map((rep) => mapWeightStackRepIndexes(rep, validIndexes));
+  const repResult = detectWeightStackRepsFromKinematics(kinematics, localTimestamps, optionsUsed);
+  repResult.reps = splitMergedWeightStackReps(repResult.reps, kinematics, localTimestamps, optionsUsed);
+  const enriched = enrichWeightStackRepMetrics(repResult.reps, kinematics, optionsUsed);
+  const mappedReps = enriched.map((rep) => mapWeightStackRepIndexes(rep, validIndexes));
 
   lastWeightStackRepDebug = buildWeightStackDebug({
-    mode,
-    warning,
+    mode: ultrasoundInfo.available ? "ultrasound_mm_primary" : "axis_projection_bounded",
+    warning: warnings.length ? warnings.join(" ") : null,
+    warnings,
     optionsUsed,
     sampleCount: input.length,
     timestampCount: resolvedTimestamps.length,
-    estimatedSampleRate: sampleRate,
-    calibration: {
-      restMs: optionsUsed.restMs,
-      restSampleCount,
-      g0: use3d ? { ax: g0[0], ay: g0[1], az: g0[2] } : { value: oneDBias },
-      restSigma,
-    },
-    axis: {
-      movementAxis,
-      dominantAxis,
-      variance: { ax: axisVariance[0], ay: axisVariance[1], az: axisVariance[2] },
-    },
-    thresholds: {
-      activityThreshold,
-      velocityThreshold,
-      minAmplitude,
-    },
+    estimatedSampleRate: estimateSampleRate(resolvedTimestamps),
+    restInfo,
+    axis: axisInfo,
+    thresholds: repResult.thresholds,
     arrays: {
-      projectedAcc,
-      filteredAcc,
-      velocity,
-      position,
-      stateByIndex: stateResult.stateByIndex,
+      projectedAccG,
+      filteredAccG,
+      magnitudeMinusG,
+      velocityProxy: kinematics.velocityProxy,
+      positionProxy: kinematics.positionProxy,
+      restMask: kinematics.restMask,
+      activeMask: kinematics.activeMask,
+      stateByIndex: repResult.stateByIndex,
     },
+    ultrasound: ultrasoundInfo.debug,
     reps: mappedReps,
-    rejectedCandidates: [...rejectedCandidates, ...stateResult.rejectedCandidates],
-    optionalFeatures: {
-      gyroAssist: detectGyroAvailability(input, validIndexes, optionsUsed.enableGyroAssist),
-      autocorrelationHint: optionsUsed.enableAutocorrelationHint
-        ? estimateAutocorrelationCycleHint(position, localTimestamps)
-        : { enabled: false, note: "Prepared only; disabled by toggle." },
-      templateMatching: optionsUsed.enableTemplateMatching
-        ? { enabled: true, note: "Template matching placeholder; reference-template distance is not score-critical yet." }
-        : { enabled: false, note: "Prepared only; disabled by toggle." },
-    },
+    rejectedCandidates: repResult.rejectedCandidates,
   });
 
   return mappedReps;
 }
 
 function resolveWeightStackTimestamps(samples, timestamps = []) {
-  if (Array.isArray(timestamps) && timestamps.length === samples.length) {
-    return timestamps.map((value, index) => Number.isFinite(Number(value)) ? Number(value) : index * 20);
+  const warnings = [];
+  let resolved = [];
+  if (Array.isArray(timestamps) && timestamps.length === samples.length && timestamps.some((value) => Number.isFinite(Number(value)))) {
+    resolved = timestamps.map((value) => Number.isFinite(Number(value)) ? Number(value) : NaN);
+  } else {
+    resolved = samples.map((sample) => firstFinite(sample?.timestamp, sample?.time, sample?.t, NaN));
   }
-  return samples.map((sample, index) => {
-    const value = Number(sample?.timestamp ?? sample?.time ?? sample?.t);
-    return Number.isFinite(value) ? value : index * 20;
-  });
+  if (!resolved.some(Number.isFinite)) {
+    warnings.push("Missing timestamps; using fallback 20 ms spacing. Timing metrics are approximate.");
+    resolved = samples.map((_, index) => index * 20);
+  } else {
+    const interval = estimateIntervalFromTimestamps(resolved.filter(Number.isFinite));
+    resolved = resolved.map((value, index) => Number.isFinite(value) ? value : index * interval);
+  }
+  const intervals = [];
+  for (let index = 1; index < resolved.length; index += 1) {
+    const delta = resolved[index] - resolved[index - 1];
+    if (delta > 0 && delta < 1000) intervals.push(delta);
+  }
+  if (intervals.length >= 5 && std(intervals) / Math.max(mean(intervals), 1) > 0.25) {
+    warnings.push("Timestamps are jittery; rep timing may be noisy.");
+  }
+  return { timestamps: resolved, warnings };
 }
 
-function estimateRestSampleCount(timestamps, restMs) {
-  if (!timestamps.length) return 0;
-  const start = timestamps[0];
-  const count = timestamps.findIndex((timestamp) => timestamp - start > restMs);
-  if (count > 3) return count;
-  return Math.max(3, Math.min(timestamps.length, Math.round(restMs / Math.max(estimateIntervalFromTimestamps(timestamps), 1))));
-}
-
-function integrateWeightStackSignal(filteredAcc, timestamps, restSigma, options) {
-  const velocity = new Array(filteredAcc.length).fill(0);
-  const position = new Array(filteredAcc.length).fill(0);
-  const restThreshold = Math.max(options.minActivityG * 0.5, restSigma * 2);
-  for (let index = 1; index < filteredAcc.length; index += 1) {
-    const dt = Math.max((timestamps[index] - timestamps[index - 1]) / 1000, 0.001);
-    const acceleration = Number(filteredAcc[index]) || 0;
-    velocity[index] = options.enableVelocityIntegration === false
-      ? acceleration
-      : velocity[index - 1] * options.leak + acceleration * dt;
-    if (Math.abs(acceleration) < restThreshold) {
-      velocity[index] *= 0.92;
+function findBestRestWindow(samples, timestamps, options) {
+  const intervalMs = estimateIntervalFromTimestamps(timestamps);
+  const windowCandidates = [Math.min(800, options.restMs), options.restMs, Math.min(1500, Math.max(800, options.restMs))];
+  const maxSearchEnd = timestamps[0] + Math.max(options.restMs * 2, 2500);
+  let best = { startIndex: 0, endIndex: Math.max(2, Math.round(options.restMs / Math.max(intervalMs, 1))), score: Infinity, restMs: options.restMs };
+  for (let start = 0; start < samples.length - 5; start += 1) {
+    if (timestamps[start] > maxSearchEnd) break;
+    for (const windowMs of windowCandidates) {
+      const endTime = timestamps[start] + windowMs;
+      let end = start;
+      while (end < samples.length && timestamps[end] <= endTime) end += 1;
+      if (end - start < 5) continue;
+      const slice = samples.slice(start, end);
+      const mag = slice.map((sample) => Math.hypot(sample.axG, sample.ayG, sample.azG));
+      const score = std(mag) + std(slice.map((sample) => sample.axG)) + std(slice.map((sample) => sample.ayG)) + std(slice.map((sample) => sample.azG));
+      if (score < best.score) best = { startIndex: start, endIndex: end - 1, score, restMs: timestamps[end - 1] - timestamps[start] };
     }
-    position[index] = options.enablePositionProxy === false
-      ? filteredAcc[index]
-      : position[index - 1] + velocity[index] * dt;
   }
-  return { velocity, position };
+  return best;
 }
 
-function runWeightStackStateMachine({ position, velocity, filteredAcc, timestamps, options, thresholds }) {
+function calibrateWeightStackRest(samples, timestamps, options) {
+  const warnings = [];
+  const windowInfo = options.enableRestQualityCheck === false
+    ? { startIndex: 0, endIndex: Math.max(2, Math.round(options.restMs / Math.max(estimateIntervalFromTimestamps(timestamps), 1))), restMs: options.restMs }
+    : findBestRestWindow(samples, timestamps, options);
+  const restSamples = samples.slice(windowInfo.startIndex, Math.min(samples.length, windowInfo.endIndex + 1));
+  const gVec = {
+    x: mean(restSamples.map((sample) => sample.axG)),
+    y: mean(restSamples.map((sample) => sample.ayG)),
+    z: mean(restSamples.map((sample) => sample.azG)),
+  };
+  const gMagnitude = Math.hypot(gVec.x, gVec.y, gVec.z);
+  const restNoiseSigma = mean([
+    std(restSamples.map((sample) => sample.axG)),
+    std(restSamples.map((sample) => sample.ayG)),
+    std(restSamples.map((sample) => sample.azG)),
+  ]);
+  const gyroBias = {
+    gx: mean(restSamples.map((sample) => sample.gxDps || 0)),
+    gy: mean(restSamples.map((sample) => sample.gyDps || 0)),
+    gz: mean(restSamples.map((sample) => sample.gzDps || 0)),
+  };
+  const restQuality = restNoiseSigma < 0.035 && Math.abs(gMagnitude - 1) < 0.25
+    ? "good"
+    : restNoiseSigma < 0.08 ? "warning" : "bad";
+  if (restQuality !== "good") warnings.push(`Rest calibration quality ${restQuality}; using per-recording gravity estimate anyway.`);
+  return {
+    restStartIndex: windowInfo.startIndex,
+    restEndIndex: Math.min(samples.length - 1, windowInfo.endIndex),
+    restMs: windowInfo.restMs,
+    gVec,
+    gMagnitude,
+    restNoiseSigma,
+    restQuality,
+    gyroBias,
+    oneDBias: mean(restSamples.map((sample) => sample.axG)),
+    warnings,
+  };
+}
+
+function estimateMotionAxisPca(linearAccVectors, timestamps, restEndIndex, options) {
+  const activeVectors = linearAccVectors.slice(Math.min(restEndIndex + 1, linearAccVectors.length - 1));
+  const vectors = activeVectors.length >= 6 ? activeVectors : linearAccVectors;
+  const variances = [
+    variance(vectors.map((value) => value[0])),
+    variance(vectors.map((value) => value[1])),
+    variance(vectors.map((value) => value[2])),
+  ];
+  const dominantIndex = variances.indexOf(Math.max(...variances));
+  const dominantAxis = ["ax", "ay", "az"][dominantIndex] || "az";
+  const dominantVector = normalizeVec([
+    dominantIndex === 0 ? 1 : 0,
+    dominantIndex === 1 ? 1 : 0,
+    dominantIndex === 2 ? 1 : 0,
+  ]);
+  const totalVariance = variances.reduce((sum, value) => sum + value, 0);
+  if (options.enableMotionAxisPca === false || totalVariance <= 0) {
+    return {
+      method: "dominant_axis",
+      movementAxis: dominantVector,
+      dominantAxis,
+      variance: { ax: variances[0], ay: variances[1], az: variances[2] },
+      explainedRatio: totalVariance ? Math.max(...variances) / totalVariance : 0,
+    };
+  }
+  const covariance = [0, 1, 2].map((row) => [0, 1, 2].map((col) => mean(vectors.map((value) => value[row] * value[col]))));
+  let axis = normalizeVec([1, 1, 1]);
+  for (let iteration = 0; iteration < 12; iteration += 1) {
+    axis = normalizeVec([
+      covariance[0][0] * axis[0] + covariance[0][1] * axis[1] + covariance[0][2] * axis[2],
+      covariance[1][0] * axis[0] + covariance[1][1] * axis[1] + covariance[1][2] * axis[2],
+      covariance[2][0] * axis[0] + covariance[2][1] * axis[1] + covariance[2][2] * axis[2],
+    ]);
+  }
+  const axisVariance = mean(vectors.map((value) => dot(value, axis) ** 2));
+  const explainedRatio = totalVariance ? axisVariance / totalVariance : 0;
+  if (!Number.isFinite(explainedRatio) || explainedRatio < 0.35) {
+    return {
+      method: "dominant_axis",
+      movementAxis: dominantVector,
+      dominantAxis,
+      variance: { ax: variances[0], ay: variances[1], az: variances[2] },
+      explainedRatio,
+    };
+  }
+  return {
+    method: "pca",
+    movementAxis: axis,
+    dominantAxis,
+    variance: { ax: variances[0], ay: variances[1], az: variances[2] },
+    explainedRatio,
+  };
+}
+
+function projectOntoAxis(vectors, axis) {
+  return vectors.map((vector) => dot(vector, axis));
+}
+
+function findFirstActiveIndex(values, startIndex, minActivityG) {
+  for (let index = Math.max(0, startIndex); index < values.length; index += 1) {
+    if (Math.abs(values[index]) >= minActivityG) return index;
+  }
+  return null;
+}
+
+function buildUltrasoundKinematics(samples, timestamps, options) {
+  const rawDistanceMm = samples.map((sample) => {
+    const value = Number(sample.distanceMm ?? sample.ultrasoundMm);
+    return Number.isFinite(value) && value > 0 ? value : null;
+  });
+  const validCount = rawDistanceMm.filter((value) => value !== null).length;
+  const coverage = samples.length ? validCount / samples.length : 0;
+  if (coverage < 0.45) {
+    return {
+      available: false,
+      debug: { available: false, validCount, coverage, note: "No usable HC-SR04 distance stream; falling back to IMU projection." },
+    };
+  }
+
+  const filledDistance = fillMissingNumericSeries(rawDistanceMm);
+  const smoothedDistanceMm = lowPassIIR(filledDistance, timestamps, Math.min(options.cutoffHz, 5));
+  const baselineCount = Math.max(5, Math.round(options.restMs / Math.max(estimateIntervalFromTimestamps(timestamps), 1)));
+  const restBaseline = percentile(smoothedDistanceMm.slice(0, Math.min(baselineCount, smoothedDistanceMm.length)), 0.5);
+  let positionProxy = smoothedDistanceMm.map((value) => restBaseline - value); // weight stack moving away from sensor usually reduces distance
+  if (Math.abs(percentile(positionProxy, 0.05)) > Math.abs(percentile(positionProxy, 0.95))) {
+    positionProxy = positionProxy.map((value) => -value);
+  }
+  const velocityProxy = new Array(positionProxy.length).fill(0);
+  for (let index = 1; index < positionProxy.length; index += 1) {
+    const dt = Math.max((timestamps[index] - timestamps[index - 1]) / 1000, 0.001);
+    velocityProxy[index] = (positionProxy[index] - positionProxy[index - 1]) / dt;
+  }
+  const restSigmaMm = std(positionProxy.slice(0, Math.min(baselineCount, positionProxy.length)));
+  const restThresholdMm = Math.max(4, restSigmaMm * 4);
+  const restMask = positionProxy.map((value, index) => rawDistanceMm[index] !== null && Math.abs(value) <= restThresholdMm);
+  const activeMask = positionProxy.map((value) => Math.abs(value) > restThresholdMm);
+  return {
+    available: true,
+    kinematics: {
+      positionProxy,
+      velocityProxy,
+      restMask,
+      activeMask,
+      source: "ultrasound_mm",
+    },
+    debug: {
+      available: true,
+      source: "HC-SR04 distanceMm",
+      validCount,
+      coverage,
+      restBaselineMm: restBaseline,
+      restSigmaMm,
+      rawDistanceMm,
+      smoothedDistanceMm,
+    },
+  };
+}
+
+function fillMissingNumericSeries(values) {
+  const result = values.slice();
+  let last = result.find((value) => value !== null);
+  if (last === undefined) return result.map(() => 0);
+  for (let index = 0; index < result.length; index += 1) {
+    if (result[index] === null) result[index] = last;
+    else last = result[index];
+  }
+  for (let index = result.length - 2; index >= 0; index -= 1) {
+    if (values[index] === null && values[index + 1] !== null) result[index] = result[index + 1];
+  }
+  return result.map((value) => Number(value) || 0);
+}
+
+function integrateBoundedWeightStackMotion(signalG, timestamps, restInfo, options) {
+  const velocityProxy = new Array(signalG.length).fill(0);
+  const positionProxy = new Array(signalG.length).fill(0);
+  const restMask = new Array(signalG.length).fill(false);
+  const activeMask = new Array(signalG.length).fill(false);
+  const stillThreshold = Math.max(options.minActivityG, restInfo.restNoiseSigma * 4);
+  const stillSamplesNeeded = Math.max(3, Math.round(180 / Math.max(estimateIntervalFromTimestamps(timestamps), 1)));
+  let stillCount = 0;
+  let bottomBaseline = 0;
+  for (let index = 1; index < signalG.length; index += 1) {
+    const dt = Math.max((timestamps[index] - timestamps[index - 1]) / 1000, 0.001);
+    const acc = Number(signalG[index]) || 0;
+    activeMask[index] = Math.abs(acc) >= stillThreshold;
+    stillCount = activeMask[index] ? 0 : stillCount + 1;
+    velocityProxy[index] = options.enableBoundedIntegration === false
+      ? acc
+      : velocityProxy[index - 1] * options.velocityLeak + acc * dt;
+    positionProxy[index] = options.enableBoundedIntegration === false
+      ? signalG[index]
+      : positionProxy[index - 1] * options.positionLeak + velocityProxy[index] * dt;
+    if (options.enableZuptReset !== false && stillCount >= stillSamplesNeeded) {
+      restMask[index] = true;
+      velocityProxy[index] = 0;
+      bottomBaseline = positionProxy[index];
+    }
+    if (options.enableZuptReset !== false && stillCount > 0) {
+      positionProxy[index] -= bottomBaseline;
+    }
+  }
+  return { velocityProxy, positionProxy, restMask, activeMask };
+}
+
+function detectWeightStackRepsFromKinematics(kinematics, timestamps, options) {
+  const position = kinematics.positionProxy || [];
+  const velocity = kinematics.velocityProxy || [];
+  const filteredAcc = kinematics.filteredAccG || [];
+  if (!position.length || position.length !== timestamps.length) {
+    return {
+      reps: [],
+      rejectedCandidates: [{ reason: "missing_kinematics" }],
+      stateByIndex: new Array(timestamps.length).fill("REST_BOTTOM"),
+      thresholds: { activityThresholdG: 0, velocityThreshold: 0, minAmplitudeProxy: 0 },
+    };
+  }
+  const positionRange = percentile(position, 0.95) - percentile(position, 0.05);
+  const usingUltrasound = kinematics.source === "ultrasound_mm" || kinematics.ultrasound?.available === true;
+  const ultrasoundNoiseMm = kinematics.ultrasound?.debug?.restSigmaMm || 0;
+  const activityThresholdG = usingUltrasound
+    ? Math.max(4, ultrasoundNoiseMm * 4)
+    : Math.max(options.minActivityG, (kinematics.restInfo?.restNoiseSigma || 0) * 4);
+  const velocityThreshold = hasNumericWeightStackOption(options.startVelocityThreshold)
+    ? Number(options.startVelocityThreshold)
+    : usingUltrasound
+      ? Math.max(percentile(velocity.map(Math.abs), 0.45), 8)
+      : Math.max(percentile(velocity.map(Math.abs), 0.55), activityThresholdG * 0.035, 0.0002);
+  const minAmplitudeProxy = hasNumericWeightStackOption(options.minAmplitude)
+    ? Number(options.minAmplitude)
+    : usingUltrasound
+      ? Math.max(positionRange * 0.12, activityThresholdG * 1.5, 10)
+      : Math.max(positionRange * 0.08, activityThresholdG * 0.006, 0.00025);
+  const result = options.enableStateMachine === false
+    ? runWeightStackSimpleCycleFallback({
+        position,
+        velocity,
+        filteredAcc,
+        restMask: kinematics.restMask,
+        timestamps,
+        options,
+        thresholds: { activityThreshold: activityThresholdG, velocityThreshold, minAmplitude: minAmplitudeProxy },
+      })
+    : runWeightStackStateMachine({
+        position,
+        velocity,
+        filteredAcc,
+        restMask: kinematics.restMask,
+        timestamps,
+        options,
+        thresholds: { activityThreshold: activityThresholdG, velocityThreshold, minAmplitude: minAmplitudeProxy },
+      });
+  return {
+    ...result,
+    thresholds: { activityThresholdG, velocityThreshold, minAmplitudeProxy },
+  };
+}
+
+function splitMergedWeightStackReps(reps, kinematics, timestamps, options) {
+  if (reps.length < 3) return reps;
+  const normalDuration = percentile(reps.map((rep) => rep.durationMs).filter((value) => value >= options.minRepMs), 0.5);
+  if (!normalDuration) return reps;
+  const position = kinematics.positionProxy || [];
+  const velocity = kinematics.velocityProxy || [];
+  const result = [];
+  reps.forEach((rep) => {
+    const shouldSplit = rep.durationMs > Math.max(normalDuration * 1.65, options.minRepMs * 2.1);
+    if (!shouldSplit) {
+      result.push(rep);
+      return;
+    }
+    const splitIndex = Math.round((rep.startIndex + rep.endIndex) / 2);
+    const makePart = (startIndex, endIndex) => {
+      const slice = position.slice(startIndex, endIndex + 1);
+      const localPeakOffset = slice.indexOf(Math.max(...slice));
+      const peakIndex = startIndex + Math.max(0, localPeakOffset);
+      const amplitude = Math.max(...slice) - Math.min(...slice);
+      return {
+        ...rep,
+        startIndex,
+        endIndex,
+        startTime: timestamps[startIndex],
+        endTime: timestamps[endIndex],
+        startTimestamp: timestamps[startIndex],
+        endTimestamp: timestamps[endIndex],
+        durationMs: timestamps[endIndex] - timestamps[startIndex],
+        upStartIndex: startIndex,
+        topIndex: peakIndex,
+        peakIndex,
+        downStartIndex: peakIndex,
+        bottomIndex: endIndex,
+        upMs: timestamps[peakIndex] - timestamps[startIndex],
+        downMs: timestamps[endIndex] - timestamps[peakIndex],
+        topPauseMs: 0,
+        bottomPauseMs: 0,
+        amplitude,
+        amplitudeProxy: amplitude,
+        peakVelocity: Math.max(...velocity.slice(startIndex, endIndex + 1).map(Math.abs), 0),
+        meanVelocity: mean(velocity.slice(startIndex, endIndex + 1).map(Math.abs)),
+        qualityFlags: {
+          ...rep.qualityFlags,
+          tooFastDown: true,
+          suspicious: true,
+        },
+        splitFromMergedRep: true,
+      };
+    };
+    result.push(makePart(rep.startIndex, splitIndex));
+    result.push(makePart(Math.min(splitIndex + 1, rep.endIndex), rep.endIndex));
+  });
+  return result;
+}
+
+function runWeightStackStateMachine({ position, velocity, filteredAcc, restMask = [], timestamps, options, thresholds }) {
   const stateByIndex = new Array(position.length).fill("REST_BOTTOM");
   const rejectedCandidates = [];
   const reps = [];
@@ -1834,7 +2194,7 @@ function runWeightStackStateMachine({ position, velocity, filteredAcc, timestamp
     const valid = durationMs >= options.minRepMs &&
       durationMs <= options.maxRepMs &&
       upMs >= options.minPhaseMs &&
-      downMs >= options.minPhaseMs &&
+      downMs >= Math.min(options.minPhaseMs, 80) &&
       amplitude >= thresholds.minAmplitude &&
       timestamps[endIndex] - lastRepEndTime >= options.refractoryMs;
 
@@ -1861,8 +2221,11 @@ function runWeightStackStateMachine({ position, velocity, filteredAcc, timestamp
       topPauseMs: Math.max(0, timestamps[candidate.downStartIndex] - timestamps[candidate.topIndex]),
       bottomPauseMs: 0,
       amplitude,
+      amplitudeProxy: amplitude,
       peakVelocity: Math.max(...velocity.slice(candidate.startIndex, endIndex + 1).map(Math.abs)),
       meanVelocity: mean(velocity.slice(candidate.startIndex, endIndex + 1).map(Math.abs)),
+      velocityLoss: 0,
+      detectionMethod: "weight_stack_axis_projection_state_machine",
       qualityFlags: {
         partialRep: false,
         tooFastDown: false,
@@ -1890,6 +2253,7 @@ function runWeightStackStateMachine({ position, velocity, filteredAcc, timestamp
           upStartIndex: index,
           topIndex: index,
           downStartIndex: index,
+          bottomIndex: index,
         };
         state = "MOVING_UP";
       }
@@ -1927,7 +2291,16 @@ function runWeightStackStateMachine({ position, velocity, filteredAcc, timestamp
 
     if (state === "MOVING_DOWN") {
       const downMs = timestamp - timestamps[candidate.downStartIndex];
-      if (downMs >= options.minPhaseMs && pos <= bottomThreshold && Math.abs(vel) <= thresholds.velocityThreshold * 1.4) {
+      if (position[index] <= position[candidate.bottomIndex]) candidate.bottomIndex = index;
+      const candidateDuration = timestamp - timestamps[candidate.startIndex];
+      if (
+        candidateDuration >= options.minRepMs &&
+        downMs >= Math.min(options.minPhaseMs, 80) &&
+        (
+          (pos <= bottomThreshold && Math.abs(vel) <= thresholds.velocityThreshold * 1.4) ||
+          restMask[index] === true
+        )
+      ) {
         state = "BOTTOM_TURN";
         finish(index);
       }
@@ -1979,8 +2352,11 @@ function runWeightStackSimpleCycleFallback({ position, velocity, filteredAcc, ti
           topPauseMs: 0,
           bottomPauseMs: 0,
           amplitude,
+          amplitudeProxy: amplitude,
           peakVelocity: Math.max(...velocity.slice(startIndex, index + 1).map(Math.abs)),
           meanVelocity: mean(velocity.slice(startIndex, index + 1).map(Math.abs)),
+          velocityLoss: 0,
+          detectionMethod: "weight_stack_axis_projection_state_machine",
           qualityFlags: { partialRep: false, tooFastDown: false, droppedWeight: false, jerky: false, suspicious: false },
         });
         lastEnd = timestamps[index];
@@ -1998,6 +2374,16 @@ function findWeightStackBottomStart(position, index, bottomThreshold) {
     if (position[i] <= bottomThreshold) return i;
   }
   return Math.max(0, index - 2);
+}
+
+function enrichWeightStackRepMetrics(reps, kinematics, options) {
+  return enrichWeightStackReps(reps, {
+    filteredAcc: kinematics.filteredAccG || [],
+    velocity: kinematics.velocityProxy || [],
+    position: kinematics.positionProxy || [],
+    timestamps: kinematics.timestamps || [],
+    options,
+  });
 }
 
 function enrichWeightStackReps(reps, { filteredAcc, velocity, position, timestamps, options }) {
@@ -2023,8 +2409,16 @@ function enrichWeightStackReps(reps, { filteredAcc, velocity, position, timestam
     const jerky = Boolean(options.enableJerkDetection && jerkRms > jerkThreshold);
     return {
       ...rep,
+      amplitudeProxy: rep.amplitudeProxy ?? rep.amplitude,
+      amplitude: rep.amplitudeProxy ?? rep.amplitude,
       romRatio,
       velocityLoss,
+      romCm: options.enableExperimentalDistance === true && hasNumericWeightStackOption(options.cmPerPositionProxy)
+        ? (rep.amplitudeProxy ?? rep.amplitude) * Number(options.cmPerPositionProxy)
+        : null,
+      distanceNote: options.enableExperimentalDistance === true && !hasNumericWeightStackOption(options.cmPerPositionProxy)
+        ? "ROM proxy only; not calibrated distance."
+        : null,
       jerkRms,
       qualityFlags: {
         ...rep.qualityFlags,
@@ -2101,25 +2495,32 @@ function buildWeightStackDebug(debug) {
   return {
     mode: debug.mode,
     warning: debug.warning ?? null,
+    warnings: debug.warnings || [],
     optionsUsed: debug.optionsUsed,
     sampleCount: debug.sampleCount ?? 0,
     timestampCount: debug.timestampCount ?? 0,
     estimatedSampleRate: debug.estimatedSampleRate ?? 0,
-    calibration: debug.calibration || {
+    restInfo: debug.restInfo || {
+      restStartIndex: 0,
+      restEndIndex: 0,
       restMs: debug.optionsUsed?.restMs ?? 0,
-      restSampleCount: 0,
-      g0: null,
-      restSigma: 0,
+      gVec: null,
+      gMagnitude: 0,
+      restNoiseSigma: 0,
+      restQuality: "unknown",
+      gyroBias: null,
     },
     axis: debug.axis || {
+      method: "unknown",
       movementAxis: null,
       dominantAxis: null,
       variance: null,
+      explainedRatio: 0,
     },
     thresholds: debug.thresholds || {
-      activityThreshold: 0,
+      activityThresholdG: 0,
       velocityThreshold: 0,
-      minAmplitude: 0,
+      minAmplitudeProxy: 0,
     },
     arrays: keepArrays
       ? arrays
@@ -2129,6 +2530,7 @@ function buildWeightStackDebug(debug) {
         ])),
     reps: debug.reps || [],
     rejectedCandidates: debug.rejectedCandidates || [],
+    ultrasound: debug.ultrasound || { available: false },
     optionalFeatures: debug.optionalFeatures || {},
   };
 }
@@ -2139,7 +2541,7 @@ function getWeightStackKinematicsDebug() {
   return lastWeightStackKinematicsDebug;
 }
 
-function buildWeightStackKinematics(inputSamples, calibrationProfile = null) {
+function buildWeightStackKinematicsDebugLegacy(inputSamples, calibrationProfile = null) {
   if (!Array.isArray(inputSamples) || inputSamples.length < 20) return null;
 
   const samples = inputSamples
@@ -2365,7 +2767,7 @@ function buildWeightStackKinematics(inputSamples, calibrationProfile = null) {
     Math.max(3, Math.round(40 / intervalMs))
   );
 
-  const fallbackGithub = buildGithubInspiredKinematics(samples, calibrationProfile);
+  const fallbackGithub = buildGithubInspiredKinematicsDebugLegacy(samples, calibrationProfile);
 
   const result = {
     method: "mahony_6dof_velocity_position_proxy",
@@ -2606,7 +3008,7 @@ function safeClamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
 }
 
-function buildGithubInspiredKinematics(samples, calibrationProfile = null) {
+function buildGithubInspiredKinematicsDebugLegacy(samples, calibrationProfile = null) {
   const timestamps = samples.map((sample) => sample.timestamp);
   const intervalMs = estimateIntervalFromTimestamps(timestamps) || 20;
   const calibrationBias = calibrationProfile?.bias || {};
@@ -2629,11 +3031,11 @@ function buildGithubInspiredKinematics(samples, calibrationProfile = null) {
 
   let angleXDeg = 0;
   let speedY = 0;
-  let distanceY = 0;
+  let positionProxyY = 0;
 
   const linearY = [];
   const speed = [];
-  const distance = [];
+  const positionProxyRaw = [];
   const angle = [];
 
   for (let index = 0; index < samples.length; index += 1) {
@@ -2664,17 +3066,17 @@ function buildGithubInspiredKinematics(samples, calibrationProfile = null) {
     }
 
     speedY += realAccelY * dt;
-    distanceY += speedY * dt;
+    positionProxyY += speedY * dt;
 
     linearY.push(realAccelY);
     speed.push(speedY);
-    distance.push(distanceY);
+    positionProxyRaw.push(positionProxyY);
     angle.push(angleXDeg);
   }
 
   const baselineCount = Math.max(5, Math.round(700 / intervalMs));
-  const baseline = percentile(distance.slice(0, baselineCount), 0.5);
-  const positionProxy = distance.map((value) => value - baseline);
+  const baseline = percentile(positionProxyRaw.slice(0, baselineCount), 0.5);
+  const positionProxy = positionProxyRaw.map((value) => value - baseline);
 
   return {
     method: "github_inspired_y_axis",
@@ -2685,7 +3087,7 @@ function buildGithubInspiredKinematics(samples, calibrationProfile = null) {
   };
 }
 
-function detectWeightStackRepsFromKinematics(kinematics, timestamps) {
+function detectWeightStackRepsFromKinematicsDebugLegacy(kinematics, timestamps) {
   if (!kinematics?.positionProxy?.length || !Array.isArray(timestamps)) {
     return [];
   }
@@ -2703,7 +3105,7 @@ function detectWeightStackRepsFromKinematics(kinematics, timestamps) {
     const github = kinematics.fallbackGithub;
 
     if (github?.positionProxy?.length === timestamps.length) {
-      return detectWeightStackRepsFromPositionAndVelocity(
+      return detectWeightStackRepsFromPositionAndVelocityDebugLegacy(
         github.positionProxy,
         github.velocityProxy,
         timestamps,
@@ -2714,7 +3116,7 @@ function detectWeightStackRepsFromKinematics(kinematics, timestamps) {
     return [];
   }
 
-  const markers = detectWeightStackRepsFromPositionAndVelocity(
+  const markers = detectWeightStackRepsFromPositionAndVelocityDebugLegacy(
     position,
     velocity,
     timestamps,
@@ -2725,7 +3127,7 @@ function detectWeightStackRepsFromKinematics(kinematics, timestamps) {
     markers.length === 0 &&
     kinematics.fallbackGithub?.positionProxy?.length === timestamps.length
   ) {
-    const fallbackMarkers = detectWeightStackRepsFromPositionAndVelocity(
+    const fallbackMarkers = detectWeightStackRepsFromPositionAndVelocityDebugLegacy(
       kinematics.fallbackGithub.positionProxy,
       kinematics.fallbackGithub.velocityProxy,
       timestamps,
@@ -2738,7 +3140,7 @@ function detectWeightStackRepsFromKinematics(kinematics, timestamps) {
   return markers;
 }
 
-function detectWeightStackRepsFromPositionAndVelocity(
+function detectWeightStackRepsFromPositionAndVelocityDebugLegacy(
   positionInput,
   velocityInput,
   timestamps,
@@ -2941,7 +3343,7 @@ function detectWeightStackRepsFromPositionAndVelocity(
   return markers;
 }
 
-function detectWeightStackRepsLegacy(rawSignal, timestamps) {
+function detectWeightStackRepsLegacyDebugOnly(rawSignal, timestamps) {
   if (!rawSignal.length || rawSignal.length !== timestamps.length) return [];
 
   const intervalMs = estimateIntervalFromTimestamps(timestamps);
@@ -3133,8 +3535,8 @@ function segmentReps(inputSamples, repMarkers) {
 function calculateRepMetrics(repSegments, mode) {
   return repSegments.map((segment, index) => {
     const marker = segment.marker || {};
-    const amplitudeProxy = Number.isFinite(Number(marker.amplitude))
-      ? Number(marker.amplitude)
+    const amplitudeProxy = Number.isFinite(Number(marker.amplitudeProxy ?? marker.amplitude))
+      ? Number(marker.amplitudeProxy ?? marker.amplitude)
       : Math.max(0, percentile(segment.primary, 0.95) - percentile(segment.primary, 0.05));
     const durationMs = Number.isFinite(Number(marker.durationMs))
       ? Number(marker.durationMs)
@@ -3357,6 +3759,12 @@ function classifyCleanReps(repMetrics, referenceMetrics = [], mode = "free_movem
     if (basis.tremor && rep.tremorScore > basis.tremor * 1.3) reasons.push("Ruckeln");
     if (basis.smoothness && rep.smoothnessScore < basis.smoothness * 0.8) reasons.push("Smoothness");
     if (mode !== "weight_stack" && basis.stability && rep.gyroStabilityScore < basis.stability * 0.7) reasons.push("Stabilität");
+    if (mode === "weight_stack" && rep.qualityFlags) {
+      if (rep.qualityFlags.partialRep) reasons.push("ROM");
+      if (rep.qualityFlags.tooFastDown) reasons.push("Tempo/Kontrolle");
+      if (rep.qualityFlags.droppedWeight) reasons.push("Gewicht kontrolliert ablassen");
+      if (rep.qualityFlags.jerky) reasons.push("Ruckeln");
+    }
     if (sensorQuality.status !== "good") reasons.push("Messung unsicher");
 
     if (sensorQuality.status !== "good" && reasons.length <= 1) rep.qualityClass = "uncertain";
@@ -3922,7 +4330,7 @@ function downloadCsv(data = samples, fileName = "gymimu-recording.csv") {
     showMessage("Keine Aufnahmedaten für den CSV-Export vorhanden.");
     return;
   }
-  const header = "timestamp_ms,ax,ay,az,gx,gy,gz,accMagnitude,gyroMagnitude";
+  const header = "timestamp_ms,ax,ay,az,gx,gy,gz,distanceMm,accMagnitude,gyroMagnitude";
   const rows = data.map((sample) =>
     [
       sample.timestamp,
@@ -3932,6 +4340,7 @@ function downloadCsv(data = samples, fileName = "gymimu-recording.csv") {
       sample.gx,
       sample.gy,
       sample.gz,
+      sample.distanceMm ?? "",
       sample.accMagnitude,
       sample.gyroMagnitude,
     ].join(","),
